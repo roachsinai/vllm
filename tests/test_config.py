@@ -33,6 +33,10 @@ from vllm.config.vllm import (
     OPTIMIZATION_LEVEL_TO_CONFIG,
     OptimizationLevel,
 )
+from vllm.model_executor.models.config import (
+    MODELS_CONFIG_MAP,
+    MoonshotKimiaForCausalLMConfig,
+)
 from vllm.platforms import current_platform
 
 DEVICE_TYPE = current_platform.device_type
@@ -221,6 +225,24 @@ def test_with_hf_config_leaves_unknown_model_type_without_architectures(
     updated = VllmConfig.with_hf_config(cfg, hf_config)
 
     assert updated.model_config.hf_config.architectures is None
+
+
+def test_kimi_audio_disables_cudagraphs():
+    compilation_config = CompilationConfig(
+        mode=CompilationMode.VLLM_COMPILE,
+        cudagraph_mode=CUDAGraphMode.FULL_AND_PIECEWISE,
+    )
+    vllm_config = SimpleNamespace(compilation_config=compilation_config)
+
+    assert (
+        MODELS_CONFIG_MAP["MoonshotKimiaForCausalLM"]
+        is MoonshotKimiaForCausalLMConfig
+    )
+
+    MoonshotKimiaForCausalLMConfig.verify_and_update_config(vllm_config)
+
+    assert compilation_config.mode == CompilationMode.VLLM_COMPILE
+    assert compilation_config.cudagraph_mode == CUDAGraphMode.NONE
 
 
 def test_async_scheduling_with_pipeline_parallelism_is_allowed():
