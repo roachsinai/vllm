@@ -11,7 +11,7 @@ import safetensors.torch
 import torch
 from transformers.utils import chat_template_utils as hf_chat_utils
 
-from tests.models.registry import HF_EXAMPLE_MODELS
+from vllm.config.speech_to_text import SpeechToTextParams
 from vllm.model_executor.models import kimi_audio as kimi_audio_model
 from vllm.model_executor.models.kimi_audio import KimiAudioForConditionalGeneration
 from vllm.model_executor.models.kimi_audio_prompt import (
@@ -25,9 +25,6 @@ from vllm.transformers_utils.processors.kimi_audio_whisper_vq import (
     WhisperVQConfig,
     WhisperVQEncoder,
 )
-
-KIMI_AUDIO_MODEL = "moonshotai/Kimi-Audio-7B-Instruct"
-
 
 class _FakePromptTokenizer:
     special_tokens = {
@@ -55,10 +52,28 @@ class _FakePromptTokenizer:
 
 
 def test_kimi_audio_tokenizer_encodes_alignment_special_tokens():
-    model_info = HF_EXAMPLE_MODELS.get_hf_info("MoonshotKimiaForCausalLM")
-    model_info.check_available_online(on_fail="skip")
+    tokenizer = KimiAudioTokenizer.__new__(KimiAudioTokenizer)
+    tokenizer._token_to_id = {}
+    tokenizer._id_to_token = {}
+    tokenizer._added_tokens_decoder = {}
+    tokenizer._unk_token_id = 151644
+    tokenizer._add_kimiaudio_special_tokens()
 
-    tokenizer = KimiAudioTokenizer.from_pretrained(KIMI_AUDIO_MODEL)
+    class FakeTiktokenEncoding:
+        def encode(self, text: str, allowed_special: set[str]):
+            assert "<|im_kimia_speech_ctd_id|>" in allowed_special
+            return [
+                tokenizer.convert_tokens_to_ids(token)
+                for token in (
+                    "<|im_media_begin|>",
+                    "<|im_kimia_text_blank|>",
+                    "<|im_media_end|>",
+                    "<|im_kimia_speech_ct_id|>",
+                    "<|im_kimia_text_eos|>",
+                )
+            ]
+
+    tokenizer._tokenizer = FakeTiktokenEncoding()
 
     token_ids = tokenizer.encode(
         "<|im_media_begin|><|im_kimia_text_blank|>"
@@ -651,13 +666,15 @@ def test_kimi_audio_generation_prompt_uses_prompt_builder(monkeypatch):
     stt_config = SimpleNamespace(sample_rate=16000)
 
     prompt = KimiAudioForConditionalGeneration.get_generation_prompt(
-        audio=audio,
-        model_config=model_config,
-        stt_config=stt_config,
-        language=None,
-        task_type="transcribe",
-        request_prompt="Please transcribe the following audio:",
-        to_language=None,
+        SpeechToTextParams(
+            audio=audio,
+            model_config=model_config,
+            stt_config=stt_config,
+            language=None,
+            task_type="transcribe",
+            request_prompt="Please transcribe the following audio:",
+            to_language=None,
+        )
     )
 
     prompt_text = captured["prompt"]
