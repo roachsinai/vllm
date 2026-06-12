@@ -25,7 +25,6 @@ from transformers import BatchFeature, ProcessorMixin
 from transformers.audio_utils import AudioInput
 from transformers.tokenization_utils_base import PreTokenizedInput, TextInput
 
-from vllm.model_executor.models.kimi_audio_prompt import KimiAudioPromptBuilder
 from vllm.transformers_utils.processors.kimi_audio_speech import (
     KimiAudioSpeechTokenizer,
 )
@@ -110,87 +109,6 @@ class KimiAudioProcessor(ProcessorMixin):
             "speech_attention_mask": speech_attention_mask,
         }
 
-    def _build_packed_kimi_token_tensors(
-        self,
-        messages: Sequence[dict[str, object]],
-        speech_token_lists: Sequence[Sequence[int]],
-        *,
-        output_type: str,
-    ) -> dict[str, torch.Tensor]:
-        audio_message_count = sum(
-            1 for message in messages if message.get("message_type") == "audio"
-        )
-        if audio_message_count <= 0:
-            audio_message_count = 1
-
-        if len(speech_token_lists) <= audio_message_count:
-            message_batches = [messages]
-            speech_batches = [speech_token_lists]
-        elif audio_message_count == 1:
-            message_batches = [messages] * len(speech_token_lists)
-            speech_batches = [[token_ids] for token_ids in speech_token_lists]
-        elif len(speech_token_lists) % audio_message_count == 0:
-            batch_size = len(speech_token_lists) // audio_message_count
-            message_batches = [messages] * batch_size
-            speech_batches = [
-                speech_token_lists[
-                    i * audio_message_count : (i + 1) * audio_message_count
-                ]
-                for i in range(batch_size)
-            ]
-        else:
-            raise ValueError(
-                "The number of audio token sequences does not match the number "
-                "of audio messages in the provided Kimi-Audio prompt template."
-            )
-
-        audio_token_rows: list[list[int]] = []
-        text_token_rows: list[list[int]] = []
-        is_continuous_rows: list[list[bool]] = []
-
-        for message_batch, speech_batch in zip(message_batches, speech_batches):
-            speech_iter = iter(speech_batch)
-            packed_messages: list[dict[str, object]] = []
-            for message in message_batch:
-                packed_message = dict(message)
-                if packed_message.get("message_type") == "audio":
-                    packed_message["content"] = list(next(speech_iter, []))
-                packed_messages.append(packed_message)
-
-            packed = KimiAudioPromptBuilder.build_token_content(
-                tokenizer=self.tokenizer,
-                messages=packed_messages,
-                output_type=output_type,
-                add_generation_prompt=True,
-            )
-            audio_token_rows.append(packed.audio_token_ids)
-            text_token_rows.append(packed.text_token_ids)
-            is_continuous_rows.append(packed.is_continuous_mask)
-
-        max_len = max((len(row) for row in audio_token_rows), default=0)
-        padded_audio_rows = [
-            row + [0] * (max_len - len(row)) for row in audio_token_rows
-        ]
-        padded_text_rows = [row + [0] * (max_len - len(row)) for row in text_token_rows]
-        padded_mask_rows = [
-            row + [False] * (max_len - len(row)) for row in is_continuous_rows
-        ]
-
-        return {
-            "audio_token_ids": torch.tensor(
-                padded_audio_rows,
-                dtype=torch.long,
-            ),
-            "text_token_ids": torch.tensor(
-                padded_text_rows,
-                dtype=torch.long,
-            ),
-            "is_continuous_mask": torch.tensor(
-                padded_mask_rows,
-                dtype=torch.bool,
-            ),
-        }
-
     def __call__(
         self,
         text: TextInput
@@ -201,7 +119,6 @@ class KimiAudioProcessor(ProcessorMixin):
         audio: AudioInput | None = None,
         return_tensors: str = "pt",
         return_speech_token_ids: bool = False,
-        return_packed_kimi_tokens: bool = False,
         messages: Sequence[dict[str, object]] | None = None,
         output_type: str = "text",
         audio_sampling_rate: int = 16000,
@@ -244,7 +161,7 @@ class KimiAudioProcessor(ProcessorMixin):
         need_speech_tokens = (
             padded_audio
             and self.speech_tokenizer is not None
-            and (return_speech_token_ids or return_packed_kimi_tokens)
+            and return_speech_token_ids
         )
         if need_speech_tokens:
             speech_tokenizer = self.speech_tokenizer
@@ -256,19 +173,6 @@ class KimiAudioProcessor(ProcessorMixin):
 
         if return_speech_token_ids and speech_token_lists:
             audio_inputs.update(self._build_speech_token_tensors(speech_token_lists))
-
-        if return_packed_kimi_tokens:
-            if messages is None:
-                raise ValueError(
-                    "messages must be provided when return_packed_kimi_tokens=True"
-                )
-            audio_inputs.update(
-                self._build_packed_kimi_token_tensors(
-                    messages,
-                    speech_token_lists,
-                    output_type=output_type,
-                )
-            )
 
         return BatchFeature(
             data={**text_inputs, **audio_inputs},

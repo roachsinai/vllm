@@ -364,9 +364,6 @@ _KIMIAUDIO_FIELD_CONFIG = {
     "audio_sample_lengths": MultiModalFieldConfig.batched("audio"),
     "speech_token_ids": MultiModalFieldConfig.batched("audio"),
     "speech_attention_mask": MultiModalFieldConfig.batched("audio"),
-    "audio_token_ids": MultiModalFieldConfig.batched("audio"),
-    "text_token_ids": MultiModalFieldConfig.batched("audio"),
-    "is_continuous_mask": MultiModalFieldConfig.batched("audio"),
 }
 
 
@@ -420,9 +417,9 @@ class KimiAudioMultiModalProcessor(BaseMultiModalProcessor[KimiAudioProcessingIn
 
         if (
             processor_kwargs.get("messages") is not None
-            and "return_packed_kimi_tokens" not in processor_kwargs
+            and processor_kwargs.get("output_type", "text") == "text"
         ):
-            processor_kwargs["return_packed_kimi_tokens"] = True
+            processor_kwargs["return_speech_token_ids"] = True
 
         # Use the context's call_hf_processor for proper handling
         return self.info.ctx.call_hf_processor(
@@ -468,6 +465,17 @@ class KimiAudioMultiModalProcessor(BaseMultiModalProcessor[KimiAudioProcessingIn
             ).tolist()
 
         def get_replacement_kimiaudio(item_idx: int):
+            if speech_token_ids is not None and item_idx < speech_token_ids.shape[0]:
+                token_row = speech_token_ids[item_idx]
+                if speech_attention_mask is not None:
+                    valid_count = int(speech_attention_mask[item_idx].sum().item())
+                    token_row = token_row[:valid_count]
+                else:
+                    token_row = token_row[token_row.ne(-1)]
+                speech_tokens = [int(token) for token in token_row.tolist()]
+                if speech_tokens:
+                    return speech_tokens
+
             num_features = (
                 prompt_audio_lengths[item_idx]
                 if item_idx < len(prompt_audio_lengths)
@@ -622,8 +630,8 @@ class KimiAudioForConditionalGeneration(
 ):
     """Kimi-Audio model for ASR transcription."""
 
-    supports_multimodal_raw_input_only: ClassVar[bool] = True
-    builds_multimodal_inputs_embeds_in_forward: ClassVar[bool] = True
+    supports_multimodal_raw_input_only: ClassVar[bool] = False
+    builds_multimodal_inputs_embeds_in_forward: ClassVar[bool] = False
 
     # Kimi-Audio supports a subset of Whisper's supported languages
     supported_languages: ClassVar[Mapping[str, str]] = {
@@ -929,640 +937,6 @@ class KimiAudioForConditionalGeneration(
         audio_embeds = self._process_audio_input(audio_input)
         return audio_embeds
 
-    def _normalize_multimodal_embeddings(
-        self,
-        multimodal_embeddings: tuple[torch.Tensor, ...] | list[torch.Tensor] | None,
-        batch_size: int,
-    ) -> list[torch.Tensor]:
-        if multimodal_embeddings is None or len(multimodal_embeddings) == 0:
-            return []
-
-        if len(multimodal_embeddings) == batch_size:
-            return [embed for embed in multimodal_embeddings]
-
-        normalized_embeds: list[torch.Tensor] = []
-        for embed in multimodal_embeddings:
-            if not isinstance(embed, torch.Tensor):
-                continue
-            if embed.dim() == 3:
-                normalized_embeds.extend(embed.unbind(dim=0))
-            else:
-                normalized_embeds.append(embed)
-
-        if normalized_embeds:
-            return normalized_embeds
-
-        first = multimodal_embeddings[0]
-        return [first] if isinstance(first, torch.Tensor) else []
-
-    def _build_kimi_audio_inputs_embeds(
-        self,
-        *,
-        audio_token_ids: torch.Tensor,
-        text_input_ids: torch.Tensor | None,
-        is_continuous_mask: torch.Tensor | None,
-        multimodal_embeddings: tuple[torch.Tensor, ...] | list[torch.Tensor] | None,
-    ) -> torch.Tensor:
-        flatten_runtime_batch = audio_token_ids.dim() == 1
-        if flatten_runtime_batch:
-            audio_token_ids = audio_token_ids.unsqueeze(0)
-            if text_input_ids is not None and text_input_ids.dim() == 1:
-                text_input_ids = text_input_ids.unsqueeze(0)
-            if is_continuous_mask is not None and is_continuous_mask.dim() == 1:
-                is_continuous_mask = is_continuous_mask.unsqueeze(0)
-
-        audio_inputs_embeds = self.language_model.model.embed_tokens(audio_token_ids)
-
-        if is_continuous_mask is not None and is_continuous_mask.any():
-            normalized_mm_embeds = self._normalize_multimodal_embeddings(
-                multimodal_embeddings,
-                batch_size=audio_inputs_embeds.shape[0],
-            )
-            if flatten_runtime_batch and len(normalized_mm_embeds) > 1:
-                normalized_mm_embeds = [torch.cat(normalized_mm_embeds, dim=0)]
-            if normalized_mm_embeds:
-                whisper_embeds = torch.zeros_like(audio_inputs_embeds)
-                for batch_idx, mm_embeds in enumerate(normalized_mm_embeds):
-                    batch_mask = is_continuous_mask[batch_idx].to(torch.bool)
-                    if not batch_mask.any():
-                        continue
-                    num_mm_tokens = int(batch_mask.sum().item())
-                    num_audio_embeds = int(mm_embeds.shape[0])
-                    num_to_use = min(num_mm_tokens, num_audio_embeds)
-                    if num_to_use <= 0:
-                        continue
-                    positions = batch_mask.nonzero(as_tuple=True)[0][:num_to_use]
-                    used_mm_embeds = mm_embeds[:num_to_use].to(
-                        dtype=audio_inputs_embeds.dtype,
-                        device=audio_inputs_embeds.device,
-                    )
-                    whisper_embeds[batch_idx, positions] = used_mm_embeds
-
-                continuous_mask = is_continuous_mask[:, :, None].to(torch.bool)
-                sqrt_two = torch.sqrt(
-                    torch.tensor(
-                        2.0,
-                        dtype=audio_inputs_embeds.dtype,
-                        device=audio_inputs_embeds.device,
-                    )
-                )
-                encoder_input_addwith_discrete_token = (
-                    audio_inputs_embeds + whisper_embeds
-                ) * sqrt_two
-                audio_inputs_embeds = (
-                    audio_inputs_embeds * (~continuous_mask)
-                    + encoder_input_addwith_discrete_token * continuous_mask
-                )
-
-        if text_input_ids is not None and torch.any(text_input_ids != 0):
-            text_inputs_embeds = self.language_model.model.embed_tokens(text_input_ids)
-            output = audio_inputs_embeds + text_inputs_embeds
-            return output.squeeze(0) if flatten_runtime_batch else output
-
-        return (
-            audio_inputs_embeds.squeeze(0)
-            if flatten_runtime_batch
-            else audio_inputs_embeds
-        )
-
-    def _pad_runtime_kimi_inputs_embeds(
-        self,
-        input_ids: torch.Tensor | None,
-        kimi_inputs_embeds: torch.Tensor,
-    ) -> tuple[torch.Tensor, bool]:
-        if input_ids is None:
-            return kimi_inputs_embeds, False
-
-        expected_tokens = input_ids.shape[-1]
-        actual_tokens = kimi_inputs_embeds.shape[-2]
-        if expected_tokens == actual_tokens:
-            return kimi_inputs_embeds, False
-
-        # The v1 runtime may pad prompt tokens for scheduling/compilation while
-        # Kimi raw dual-stream tensors still describe only the scheduled prefix.
-        padded_inputs_embeds = self.embed_input_ids(input_ids)
-        if input_ids.dim() == 1 and kimi_inputs_embeds.dim() == 2:
-            padded_inputs_embeds[:actual_tokens] = kimi_inputs_embeds
-        elif input_ids.dim() == 2 and kimi_inputs_embeds.dim() == 3:
-            padded_inputs_embeds[:, :actual_tokens] = kimi_inputs_embeds
-        else:
-            msg = (
-                "Unsupported Kimi runtime embedding padding shapes: "
-                f"input_ids={tuple(input_ids.shape)}, "
-                f"inputs_embeds={tuple(kimi_inputs_embeds.shape)}."
-            )
-            raise ValueError(msg)
-
-        return padded_inputs_embeds, True
-
-    def _slice_runtime_kimi_prompt_inputs(
-        self,
-        *,
-        input_ids: torch.Tensor | None,
-        positions: torch.Tensor,
-        audio_token_ids: torch.Tensor | list[torch.Tensor],
-        text_input_ids: torch.Tensor | list[torch.Tensor] | None,
-        is_continuous_mask: torch.Tensor | list[torch.Tensor] | None,
-        runtime_request_num_scheduled_tokens: torch.Tensor | Sequence[int] | None = None,
-        runtime_request_has_raw_mm_inputs: torch.Tensor | Sequence[bool] | None = None,
-    ) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
-        """Align raw Kimi prompt tensors to the scheduled runtime chunk.
-
-        In the v1 runtime, prefix caching or chunked prefill may schedule only a
-        suffix of the original prompt. The raw dual-stream Kimi tensors are
-        still stored at full prompt length, so we need to slice them to the
-        positions of the currently scheduled tokens before building
-        `inputs_embeds`.
-        """
-        if input_ids is None:
-            return audio_token_ids, text_input_ids, is_continuous_mask
-
-        def _as_request_tensor_list(
-            value: torch.Tensor | list[torch.Tensor] | None,
-            *,
-            batch_size: int,
-        ) -> list[torch.Tensor] | None:
-            if value is None:
-                return None
-            if isinstance(value, torch.Tensor):
-                if value.dim() == 1:
-                    return [value]
-                if value.dim() == 2 and value.shape[0] == batch_size:
-                    return [row for row in value]
-                return None
-            if not isinstance(value, (list, tuple)):
-                return None
-            normalized: list[torch.Tensor] = []
-            for item in value:
-                tensor = item if isinstance(item, torch.Tensor) else torch.as_tensor(
-                    item,
-                    device=input_ids.device,
-                )
-                if tensor.dim() == 2 and tensor.shape[0] == 1:
-                    tensor = tensor.squeeze(0)
-                if tensor.dim() != 1:
-                    return None
-                normalized.append(tensor)
-            return normalized
-
-        def _cat_request_tensors(
-            tensors: list[torch.Tensor] | None,
-        ) -> torch.Tensor | None:
-            if tensors is None:
-                return None
-            if len(tensors) == 0:
-                return None
-            if len(tensors) == 1:
-                return tensors[0]
-            return torch.cat(tensors, dim=0)
-
-        def _as_runtime_request_metadata(
-            value: torch.Tensor | Sequence[int] | Sequence[bool] | None,
-            *,
-            dtype: torch.dtype,
-        ) -> torch.Tensor | None:
-            if value is None:
-                return None
-            if isinstance(value, torch.Tensor):
-                if value.dim() == 1:
-                    return value.to(dtype=dtype)
-                if value.dim() == 2 and value.shape[0] == 1:
-                    return value.squeeze(0).to(dtype=dtype)
-                return None
-            if not isinstance(value, Sequence) or isinstance(value, (str, bytes)):
-                return None
-            return torch.as_tensor(list(value), dtype=dtype)
-
-        def _slice_single_request_runtime_tokens(
-            *,
-            seq_input_ids: torch.Tensor,
-            seq_positions: torch.Tensor,
-            audio_tensor: torch.Tensor,
-            text_tensor: torch.Tensor | None,
-            mask_tensor: torch.Tensor | None,
-        ) -> tuple[
-            torch.Tensor | None,
-            torch.Tensor | None,
-            torch.Tensor | None,
-        ] | None:
-            if (
-                seq_positions.dim() != 1
-                or seq_positions.numel() != seq_input_ids.numel()
-            ):
-                return None
-            if seq_positions.numel() == 0:
-                return None
-
-            prompt_tokens = int(audio_tensor.shape[-1])
-            seq_positions = seq_positions.to(
-                device=audio_tensor.device,
-                dtype=torch.long,
-            )
-            if int(seq_positions.min().item()) < 0:
-                return None
-
-            prompt_mask = seq_positions < prompt_tokens
-            if not prompt_mask.any():
-                return None, None, None
-
-            audio_output = torch.full(
-                seq_input_ids.shape,
-                fill_value=KimiAudioProcessor.KIMIA_TEXT_BLANK,
-                dtype=audio_tensor.dtype,
-                device=audio_tensor.device,
-            )
-            text_output = seq_input_ids.to(
-                device=audio_tensor.device,
-                dtype=(
-                    text_tensor.dtype
-                    if text_tensor is not None
-                    else seq_input_ids.dtype
-                ),
-            ).clone()
-            mask_output = (
-                torch.zeros(
-                    seq_input_ids.shape,
-                    dtype=mask_tensor.dtype,
-                    device=audio_tensor.device,
-                )
-                if mask_tensor is not None
-                else None
-            )
-
-            selected_positions = seq_positions[prompt_mask]
-            audio_output[prompt_mask] = audio_tensor.index_select(
-                0,
-                selected_positions,
-            )
-            if text_tensor is not None:
-                text_output[prompt_mask] = text_tensor.index_select(
-                    0,
-                    selected_positions.to(device=text_tensor.device),
-                ).to(device=audio_tensor.device)
-            if mask_output is not None:
-                mask_output[prompt_mask] = mask_tensor.index_select(
-                    0,
-                    selected_positions.to(device=mask_tensor.device),
-                ).to(device=audio_tensor.device)
-
-            return audio_output, text_output, mask_output
-
-        def _slice_request_tensor(
-            tensor: torch.Tensor,
-            seq_positions: torch.Tensor,
-        ) -> torch.Tensor:
-            if seq_positions.numel() == 0:
-                return tensor[:0]
-            prompt_tokens = tensor.shape[-1]
-            seq_positions = seq_positions.to(
-                device=tensor.device,
-                dtype=torch.long,
-            )
-            if (
-                int(seq_positions.min().item()) >= 0
-                and int(seq_positions.max().item()) < prompt_tokens
-            ):
-                return tensor.index_select(0, seq_positions)
-            return tensor
-
-        if input_ids.dim() == 1:
-            audio_request_tensors = _as_request_tensor_list(
-                audio_token_ids,
-                batch_size=(
-                    len(audio_token_ids)
-                    if isinstance(audio_token_ids, (list, tuple))
-                    else int(audio_token_ids.shape[0])
-                    if isinstance(audio_token_ids, torch.Tensor)
-                    and audio_token_ids.dim() == 2
-                    else 1
-                ),
-            )
-            text_request_tensors = (
-                _as_request_tensor_list(
-                    text_input_ids,
-                    batch_size=len(audio_request_tensors),
-                )
-                if audio_request_tensors is not None
-                else None
-            )
-            mask_request_tensors = (
-                _as_request_tensor_list(
-                    is_continuous_mask,
-                    batch_size=len(audio_request_tensors),
-                )
-                if audio_request_tensors is not None
-                else None
-            )
-            runtime_request_token_counts = _as_runtime_request_metadata(
-                runtime_request_num_scheduled_tokens,
-                dtype=torch.long,
-            )
-            runtime_request_has_raw_mm = _as_runtime_request_metadata(
-                runtime_request_has_raw_mm_inputs,
-                dtype=torch.bool,
-            )
-            if (
-                audio_request_tensors is not None
-                and runtime_request_token_counts is not None
-                and runtime_request_has_raw_mm is not None
-                and runtime_request_token_counts.numel()
-                == runtime_request_has_raw_mm.numel()
-                and int(runtime_request_token_counts.sum().item())
-                == input_ids.numel()
-            ):
-                expected_raw_mm_requests = int(
-                    runtime_request_has_raw_mm.sum().item()
-                )
-                if expected_raw_mm_requests == len(audio_request_tensors):
-                    if (
-                        text_request_tensors is not None
-                        and len(text_request_tensors) != expected_raw_mm_requests
-                    ):
-                        text_request_tensors = None
-                    if (
-                        mask_request_tensors is not None
-                        and len(mask_request_tensors) != expected_raw_mm_requests
-                    ):
-                        mask_request_tensors = None
-
-                    if expected_raw_mm_requests == 0:
-                        return None, None, None
-
-                    audio_dtype = audio_request_tensors[0].dtype
-                    mask_dtype = (
-                        mask_request_tensors[0].dtype
-                        if mask_request_tensors is not None
-                        and len(mask_request_tensors) > 0
-                        else torch.bool
-                    )
-                    audio_segment_outputs: list[torch.Tensor] = []
-                    text_segment_outputs: list[torch.Tensor] = []
-                    mask_segment_outputs: list[torch.Tensor] | None = (
-                        [] if mask_request_tensors is not None else None
-                    )
-                    prompt_req_idx = 0
-                    token_offset = 0
-
-                    for num_tokens, has_raw_mm in zip(
-                        runtime_request_token_counts.tolist(),
-                        runtime_request_has_raw_mm.tolist(),
-                    ):
-                        seq_len = int(num_tokens)
-                        if seq_len <= 0:
-                            continue
-
-                        next_offset = token_offset + seq_len
-                        seq_input_ids = input_ids[token_offset:next_offset]
-                        seq_positions = positions[token_offset:next_offset]
-                        token_offset = next_offset
-
-                        sliced_segment = None
-                        if has_raw_mm:
-                            sliced_segment = _slice_single_request_runtime_tokens(
-                                seq_input_ids=seq_input_ids,
-                                seq_positions=seq_positions,
-                                audio_tensor=audio_request_tensors[prompt_req_idx],
-                                text_tensor=(
-                                    text_request_tensors[prompt_req_idx]
-                                    if text_request_tensors is not None
-                                    else None
-                                ),
-                                mask_tensor=(
-                                    mask_request_tensors[prompt_req_idx]
-                                    if mask_request_tensors is not None
-                                    else None
-                                ),
-                            )
-                            prompt_req_idx += 1
-
-                        if sliced_segment is not None and sliced_segment[0] is not None:
-                            audio_segment_outputs.append(sliced_segment[0])
-                            text_segment_outputs.append(sliced_segment[1])
-                            if mask_segment_outputs is not None:
-                                mask_segment_outputs.append(sliced_segment[2])
-                            continue
-
-                        audio_segment_outputs.append(
-                            torch.full(
-                                seq_input_ids.shape,
-                                fill_value=KimiAudioProcessor.KIMIA_TEXT_BLANK,
-                                dtype=audio_dtype,
-                                device=input_ids.device,
-                            )
-                        )
-                        text_segment_outputs.append(seq_input_ids)
-                        if mask_segment_outputs is not None:
-                            mask_segment_outputs.append(
-                                torch.zeros(
-                                    seq_input_ids.shape,
-                                    dtype=mask_dtype,
-                                    device=input_ids.device,
-                                )
-                            )
-
-                    if prompt_req_idx == len(audio_request_tensors):
-                        return (
-                            _cat_request_tensors(audio_segment_outputs),
-                            _cat_request_tensors(text_segment_outputs),
-                            _cat_request_tensors(mask_segment_outputs),
-                        )
-            if audio_request_tensors is not None and len(audio_request_tensors) == 1:
-                single_request_runtime_tokens = _slice_single_request_runtime_tokens(
-                    seq_input_ids=input_ids,
-                    seq_positions=positions,
-                    audio_tensor=audio_request_tensors[0],
-                    text_tensor=(
-                        text_request_tensors[0]
-                        if text_request_tensors is not None
-                        else None
-                    ),
-                    mask_tensor=(
-                        mask_request_tensors[0]
-                        if mask_request_tensors is not None
-                        else None
-                    ),
-                )
-                if single_request_runtime_tokens is not None:
-                    return single_request_runtime_tokens
-            if audio_request_tensors is not None and len(audio_request_tensors) == 1:
-                audio_token_ids = audio_request_tensors[0]
-                if text_request_tensors is not None:
-                    text_input_ids = text_request_tensors[0]
-                if mask_request_tensors is not None:
-                    is_continuous_mask = mask_request_tensors[0]
-            if audio_request_tensors is not None:
-                if positions.dim() == 1 and positions.numel() == len(
-                    audio_request_tensors
-                ):
-                    request_positions = positions.to(dtype=torch.long).tolist()
-                    decode_only = [
-                        pos >= int(tensor.shape[-1])
-                        for pos, tensor in zip(
-                            request_positions,
-                            audio_request_tensors,
-                        )
-                    ]
-                    if all(decode_only):
-                        return None, None, None
-                if positions.dim() == 1:
-                    split_points = (positions[1:] <= positions[:-1]).nonzero(
-                        as_tuple=True
-                    )[0] + 1
-                    position_segments = torch.tensor_split(
-                        positions,
-                        split_points.tolist(),
-                    )
-                    input_segments = torch.tensor_split(
-                        input_ids,
-                        split_points.tolist(),
-                    )
-                elif positions.dim() == 2 and positions.shape[0] == len(
-                    audio_request_tensors
-                ):
-                    position_segments = [row for row in positions]
-                    input_segments = [row for row in input_ids]
-                else:
-                    position_segments = []
-                    input_segments = []
-
-                if (
-                    len(audio_request_tensors) > 0
-                    and len(position_segments) == len(audio_request_tensors)
-                ):
-                    decode_only_segments = [
-                        seq_positions.numel() > 0
-                        and int(seq_positions.min().item()) >= int(tensor.shape[-1])
-                        for seq_positions, tensor in zip(
-                            position_segments,
-                            audio_request_tensors,
-                        )
-                    ]
-                    if decode_only_segments and all(decode_only_segments):
-                        return None, None, None
-
-                if len(position_segments) >= len(audio_request_tensors):
-                    mask_dtype = (
-                        mask_request_tensors[0].dtype
-                        if mask_request_tensors is not None
-                        and len(mask_request_tensors) > 0
-                        else torch.bool
-                    )
-                    audio_dtype = audio_request_tensors[0].dtype
-                    audio_segment_outputs: list[torch.Tensor] = []
-                    text_segment_outputs: list[torch.Tensor] = []
-                    mask_segment_outputs: list[torch.Tensor] | None = (
-                        [] if mask_request_tensors is not None else None
-                    )
-                    request_idx = 0
-
-                    for seg_idx, seq_positions in enumerate(position_segments):
-                        seq_input_ids = input_segments[seg_idx]
-
-                        sliced_segment = None
-                        if request_idx < len(audio_request_tensors):
-                            sliced_segment = _slice_single_request_runtime_tokens(
-                                seq_input_ids=seq_input_ids,
-                                seq_positions=seq_positions,
-                                audio_tensor=audio_request_tensors[request_idx],
-                                text_tensor=(
-                                    text_request_tensors[request_idx]
-                                    if text_request_tensors is not None
-                                    else None
-                                ),
-                                mask_tensor=(
-                                    mask_request_tensors[request_idx]
-                                    if mask_request_tensors is not None
-                                    else None
-                                ),
-                            )
-
-                        if sliced_segment is not None and sliced_segment[0] is not None:
-                            audio_segment_outputs.append(sliced_segment[0])
-                            text_segment_outputs.append(sliced_segment[1])
-                            if mask_segment_outputs is not None:
-                                mask_segment_outputs.append(sliced_segment[2])
-                            request_idx += 1
-                            continue
-
-                        audio_segment_outputs.append(
-                            torch.full(
-                                seq_input_ids.shape,
-                                fill_value=KimiAudioProcessor.KIMIA_TEXT_BLANK,
-                                dtype=audio_dtype,
-                                device=seq_input_ids.device,
-                            )
-                        )
-                        text_segment_outputs.append(seq_input_ids)
-                        if mask_segment_outputs is not None:
-                            mask_segment_outputs.append(
-                                torch.zeros(
-                                    seq_input_ids.shape,
-                                    dtype=mask_dtype,
-                                    device=seq_input_ids.device,
-                                )
-                            )
-
-                    if request_idx == len(audio_request_tensors):
-                        return (
-                            _cat_request_tensors(audio_segment_outputs),
-                            _cat_request_tensors(text_segment_outputs),
-                            _cat_request_tensors(mask_segment_outputs),
-                        )
-                audio_token_ids = _cat_request_tensors(audio_request_tensors)
-                if text_request_tensors is not None:
-                    text_input_ids = _cat_request_tensors(text_request_tensors)
-                if mask_request_tensors is not None:
-                    is_continuous_mask = _cat_request_tensors(
-                        mask_request_tensors
-                    )
-
-        scheduled_tokens = input_ids.shape[-1]
-        prompt_tokens = audio_token_ids.shape[-1]
-        if scheduled_tokens >= prompt_tokens:
-            return audio_token_ids, text_input_ids, is_continuous_mask
-
-        if positions.numel() == 0:
-            return audio_token_ids, text_input_ids, is_continuous_mask
-
-        def _normalize_index(index: torch.Tensor) -> torch.Tensor | None:
-            if index.dim() == 1:
-                return index
-            if index.dim() == 2 and index.shape[0] == 1:
-                return index.squeeze(0)
-            return None
-
-        seq_positions = _normalize_index(positions)
-        if seq_positions is None:
-            return audio_token_ids, text_input_ids, is_continuous_mask
-
-        seq_positions = seq_positions.to(device=audio_token_ids.device).long()
-        if seq_positions.numel() != scheduled_tokens:
-            return audio_token_ids, text_input_ids, is_continuous_mask
-        if seq_positions.numel() == 0:
-            return audio_token_ids, text_input_ids, is_continuous_mask
-        if int(seq_positions.min().item()) >= prompt_tokens:
-            return None, None, None
-        if int(seq_positions.min().item()) < 0:
-            return audio_token_ids, text_input_ids, is_continuous_mask
-        if int(seq_positions.max().item()) >= prompt_tokens:
-            return audio_token_ids, text_input_ids, is_continuous_mask
-
-        def _slice_seq(tensor: torch.Tensor | None) -> torch.Tensor | None:
-            if tensor is None:
-                return None
-            if tensor.dim() == 1:
-                return tensor.index_select(0, seq_positions)
-            if tensor.dim() == 2 and tensor.shape[0] == 1:
-                sliced = tensor[0].index_select(0, seq_positions)
-                return sliced.unsqueeze(0)
-            return tensor
-
-        return (
-            _slice_seq(audio_token_ids),
-            _slice_seq(text_input_ids),
-            _slice_seq(is_continuous_mask),
-        )
-
     def embed_input_ids(
         self,
         input_ids: torch.Tensor,
@@ -1582,9 +956,9 @@ class KimiAudioForConditionalGeneration(
             input_ids,
             fill_value=KimiAudioProcessor.KIMIA_TEXT_BLANK,
         )
-        inputs_embeds = self.language_model.model.embed_tokens(
-            input_ids
-        ) + self.language_model.model.embed_tokens(blank_audio_ids)
+        token_embeds = self.language_model.model.embed_tokens(input_ids)
+        blank_embeds = self.language_model.model.embed_tokens(blank_audio_ids)
+        inputs_embeds = token_embeds + blank_embeds
 
         if multimodal_embeddings is None or len(multimodal_embeddings) == 0:
             return inputs_embeds
@@ -1630,10 +1004,11 @@ class KimiAudioForConditionalGeneration(
 
             actual_positions = segment_positions[:num_to_use]
             used_audio_embeds = audio_embeds[:num_to_use].to(dtype=inputs_embeds.dtype)
-            text_at_positions = inputs_embeds[actual_positions].clone()
+            speech_at_positions = token_embeds[actual_positions].clone()
+            blank_at_positions = blank_embeds[actual_positions].clone()
             inputs_embeds[actual_positions] = (
-                used_audio_embeds + text_at_positions
-            ) * (2**0.5)
+                used_audio_embeds + speech_at_positions
+            ) * (2**0.5) + blank_at_positions
         return inputs_embeds
 
     def forward(
@@ -1647,78 +1022,10 @@ class KimiAudioForConditionalGeneration(
         if intermediate_tensors is not None:
             inputs_embeds = None
 
-        audio_token_ids = kwargs.pop("audio_token_ids", None)
-        text_input_ids = kwargs.pop("text_token_ids", None)
-        is_continuous_mask = kwargs.pop("is_continuous_mask", None)
-        runtime_request_num_scheduled_tokens = kwargs.pop(
-            "runtime_request_num_scheduled_tokens",
-            None,
-        )
-        runtime_request_has_raw_mm_inputs = kwargs.pop(
-            "runtime_request_has_raw_mm_inputs",
-            None,
-        )
         multimodal_embeddings = kwargs.get("multimodal_embeddings")
 
         model_input_ids = input_ids
-        if audio_token_ids is not None:
-            if (
-                input_ids is not None
-                and input_ids.dim() == 1
-                and isinstance(audio_token_ids, torch.Tensor)
-            ):
-                if audio_token_ids.dim() == 2 and audio_token_ids.shape[0] == 1:
-                    audio_token_ids = audio_token_ids.squeeze(0)
-                if (
-                    text_input_ids is not None
-                    and isinstance(text_input_ids, torch.Tensor)
-                    and text_input_ids.dim() == 2
-                    and text_input_ids.shape[0] == 1
-                ):
-                    text_input_ids = text_input_ids.squeeze(0)
-                if (
-                    is_continuous_mask is not None
-                    and isinstance(is_continuous_mask, torch.Tensor)
-                    and is_continuous_mask.dim() == 2
-                    and is_continuous_mask.shape[0] == 1
-                ):
-                    is_continuous_mask = is_continuous_mask.squeeze(0)
-            (
-                audio_token_ids,
-                text_input_ids,
-                is_continuous_mask,
-            ) = self._slice_runtime_kimi_prompt_inputs(
-                input_ids=input_ids,
-                positions=positions,
-                audio_token_ids=audio_token_ids,
-                text_input_ids=text_input_ids,
-                is_continuous_mask=is_continuous_mask,
-                runtime_request_num_scheduled_tokens=(
-                    runtime_request_num_scheduled_tokens
-                ),
-                runtime_request_has_raw_mm_inputs=(
-                    runtime_request_has_raw_mm_inputs
-                ),
-            )
-            if inputs_embeds is None:
-                kimi_inputs_embeds = self._build_kimi_audio_inputs_embeds(
-                    audio_token_ids=audio_token_ids,
-                    text_input_ids=text_input_ids,
-                    is_continuous_mask=is_continuous_mask,
-                    multimodal_embeddings=multimodal_embeddings,
-                )
-                inputs_embeds, used_runtime_padding = (
-                    self._pad_runtime_kimi_inputs_embeds(
-                        input_ids=input_ids,
-                        kimi_inputs_embeds=kimi_inputs_embeds,
-                    )
-                )
-                model_input_ids = input_ids if used_runtime_padding else audio_token_ids
-            else:
-                model_input_ids = (
-                    input_ids if input_ids is not None else audio_token_ids
-                )
-        elif inputs_embeds is None and model_input_ids is not None:
+        if inputs_embeds is None and model_input_ids is not None:
             inputs_embeds = self.embed_input_ids(
                 model_input_ids,
                 multimodal_embeddings=multimodal_embeddings,
@@ -1802,10 +1109,6 @@ class KimiAudioForConditionalGeneration(
         prompt = KimiAudioPromptBuilder.build_transcription_prompt(
             request_prompt=request_prompt,
         )
-        messages: list[dict[str, object]] = [
-            {"role": "user", "message_type": "text", "content": request_prompt},
-            {"role": "user", "message_type": "audio"},
-        ]
 
         prompt_token_ids = tokenizer.encode(prompt)
 
@@ -1813,7 +1116,7 @@ class KimiAudioForConditionalGeneration(
             prompt_token_ids=prompt_token_ids,
             multi_modal_data={"audio": audio},
             mm_processor_kwargs={
-                "messages": messages,
+                "return_speech_token_ids": True,
                 "output_type": "text",
             },
         )

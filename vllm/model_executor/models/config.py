@@ -242,19 +242,12 @@ class JinaForRankingConfig(VerifyAndUpdateConfig):
 class MoonshotKimiaForCausalLMConfig(VerifyAndUpdateConfig):
     @staticmethod
     def verify_and_update_config(vllm_config: "VllmConfig") -> None:
-        # Kimi-Audio's dual-stream prompt assembly is correct under eager mode
-        # and torch.compile, but cudagraph replay reuses stale runtime-aligned
-        # Kimi prompt chunks and corrupts output. Keep compile enabled and only
-        # disable cudagraph capture for this model.
-        from vllm.config.compilation import CUDAGraphMode
-
-        compilation_config = vllm_config.compilation_config
-        if compilation_config.cudagraph_mode != CUDAGraphMode.NONE:
-            compilation_config.cudagraph_mode = CUDAGraphMode.NONE
-            logger.info(
-                "MoonshotKimiaForCausalLM disables cudagraphs to preserve "
-                "correct Kimi-Audio dual-stream generation."
-            )
+        # Kimi-Audio text-output requests now follow the standard vLLM
+        # multimodal embedding path: speech token ids are inserted into
+        # `input_ids`, Whisper embeddings are merged by `embed_input_ids`, and
+        # `forward` receives the final `inputs_embeds`. No model-specific
+        # cudagraph override is required for the supported text-output subset.
+        del vllm_config
 
 
 class JinaRobertaModelConfig(VerifyAndUpdateConfig):
