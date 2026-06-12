@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Optional
 
 import torch
 import torch.nn.functional as F
@@ -26,7 +25,7 @@ from transformers.models.whisper.modeling_whisper import (
 
 @dataclass
 class QuantizedBaseModelOutput(BaseModelOutput):
-    quantized_token_ids: Optional[torch.LongTensor] = None
+    quantized_token_ids: torch.LongTensor | None = None
 
 
 class WhisperVQConfig(WhisperConfig):
@@ -633,10 +632,7 @@ class WhisperVQEncoder(WhisperPreTrainedModel):
             if output_hidden_states:
                 encoder_states = encoder_states + (hidden_states,)
 
-            to_drop = False
-            if self.training:
-                if torch.rand([]) < self.layerdrop:
-                    to_drop = True
+            to_drop = self.training and torch.rand([]) < self.layerdrop
 
             if to_drop:
                 layer_outputs = (None, None)

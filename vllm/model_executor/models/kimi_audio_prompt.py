@@ -64,6 +64,8 @@ class KimiAudioPromptBuilder:
             raise ValueError(f"Unsupported message_type: {message_type}")
         if output_type not in {"text", "both"}:
             raise ValueError(f"Unsupported output_type: {output_type}")
+        if audio_count < 0:
+            raise ValueError("audio_count must be non-negative")
 
         role_prefix = cls.USER_START if role == "user" else cls.ASSISTANT_START
 
@@ -105,7 +107,8 @@ class KimiAudioPromptBuilder:
             role = str(message["role"])
             message_type = str(message.get("message_type") or "text")
             content = str(message.get("content") or "")
-            audio_count = int(message.get("audio_count", 1) or 1)
+            audio_count_value = message.get("audio_count", 1)
+            audio_count = 1 if audio_count_value is None else int(audio_count_value)
             prompt_parts.append(
                 cls.build_message(
                     role=role,

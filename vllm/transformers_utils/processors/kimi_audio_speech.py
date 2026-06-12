@@ -9,12 +9,12 @@ import os
 from collections.abc import Sequence
 from functools import lru_cache
 from glob import glob
+from math import gcd
 from typing import Any
 
 import numpy as np
 import safetensors
 import torch
-import torchaudio
 from huggingface_hub import snapshot_download
 from transformers import WhisperFeatureExtractor
 
@@ -49,7 +49,13 @@ def _load_local_quantize_encoder(
     config.quantize_encoder_only = True
     model = WhisperVQEncoder(config)
     state_dict = {}
-    for path in glob(os.path.join(model_path, "model*.safetensors")):
+    weight_paths = sorted(glob(os.path.join(model_path, "model*.safetensors")))
+    if not weight_paths:
+        raise FileNotFoundError(
+            f"No model*.safetensors files found in Kimi-Audio speech tokenizer "
+            f"path: {model_path}"
+        )
+    for path in weight_paths:
         with safetensors.safe_open(path, framework="pt", device="cpu") as weights_file:
             for key in tuple(weights_file.keys()):
                 state_dict[key] = weights_file.get_tensor(key)
@@ -77,7 +83,6 @@ class KimiAudioSpeechTokenizer:
         )
         self._model = model
         self._feature_extractor = feature_extractor
-        self._resamplers: dict[int, torchaudio.transforms.Resample] = {}
 
     def _ensure_loaded(self) -> tuple[Any, WhisperFeatureExtractor]:
         resolved_model_path = _resolve_speech_tokenizer_path(self.model_name_or_path)
@@ -95,20 +100,31 @@ class KimiAudioSpeechTokenizer:
 
     def _resample_if_needed(
         self,
-        audio: torch.Tensor,
+        audio: np.ndarray,
         sample_rate: int,
         target_sr: int,
-    ) -> torch.Tensor:
+    ) -> np.ndarray:
         if sample_rate == target_sr:
             return audio
-        resampler = self._resamplers.get(sample_rate)
-        if resampler is None:
-            resampler = torchaudio.transforms.Resample(
-                orig_freq=sample_rate,
-                new_freq=target_sr,
-            ).to(self.device)
-            self._resamplers[sample_rate] = resampler
-        return resampler(audio)
+        from scipy.signal import resample_poly
+
+        sample_gcd = gcd(int(sample_rate), int(target_sr))
+        resampled = resample_poly(
+            audio,
+            up=target_sr // sample_gcd,
+            down=sample_rate // sample_gcd,
+        )
+        return np.asarray(resampled, dtype=np.float32)
+
+    def _to_mono_audio(self, audio: np.ndarray | torch.Tensor) -> np.ndarray:
+        if isinstance(audio, torch.Tensor):
+            audio = audio.detach().cpu().numpy()
+        audio_array = np.asarray(audio, dtype=np.float32)
+        if audio_array.ndim <= 1:
+            return audio_array.reshape(-1)
+        if audio_array.shape[0] <= audio_array.shape[-1]:
+            return audio_array[0]
+        return audio_array[:, 0]
 
     def encode(
         self,
@@ -123,17 +139,12 @@ class KimiAudioSpeechTokenizer:
         segments: list[np.ndarray] = []
         segment_to_audio_idx: list[int] = []
         for audio_idx, audio in enumerate(audios):
-            if isinstance(audio, np.ndarray):
-                audio_tensor = torch.from_numpy(audio)
-            else:
-                audio_tensor = audio.detach().cpu()
-            if audio_tensor.dim() == 1:
-                audio_tensor = audio_tensor.unsqueeze(0)
-            audio_tensor = audio_tensor.to(dtype=torch.float32, device=self.device)
-            audio_tensor = self._resample_if_needed(
-                audio_tensor, sampling_rate, target_sr
+            mono_audio = self._to_mono_audio(audio)
+            mono_audio = self._resample_if_needed(
+                mono_audio,
+                sampling_rate,
+                target_sr,
             )
-            mono_audio = audio_tensor[0].detach().cpu().numpy()
             if mono_audio.size == 0:
                 continue
 

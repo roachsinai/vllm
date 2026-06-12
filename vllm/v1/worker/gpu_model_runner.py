@@ -1622,34 +1622,8 @@ class GPUModelRunner(
             return {}
 
         mm_kwargs = list[tuple[str, MultiModalKwargsItem]]()
-        include_runtime_request_metadata = bool(
-            getattr(
-                self.model,
-                "builds_multimodal_inputs_embeds_in_forward",
-                False,
-            )
-        )
-        runtime_request_num_scheduled_tokens: list[int] = []
-        runtime_request_has_raw_mm_inputs: list[bool] = []
-        for req_id in self.input_batch.req_ids:
-            num_scheduled_tokens = scheduler_output.num_scheduled_tokens.get(req_id, 0)
-            if num_scheduled_tokens <= 0:
-                continue
-
-            if include_runtime_request_metadata:
-                runtime_request_num_scheduled_tokens.append(num_scheduled_tokens)
-
-            req_state = self.requests[req_id]
-            prompt_token_ids = req_state.prompt_token_ids
-            prompt_len = len(prompt_token_ids) if prompt_token_ids is not None else 0
-            needs_raw_mm_inputs = req_state.num_computed_tokens < prompt_len
-            if include_runtime_request_metadata:
-                runtime_request_has_raw_mm_inputs.append(needs_raw_mm_inputs)
-            if not needs_raw_mm_inputs:
-                # Pure decode steps do not need the raw multimodal prompt tensors.
-                continue
-
-            for feature in req_state.mm_features:
+        for req in scheduler_output.scheduled_new_reqs:
+            for feature in req.mm_features:
                 if feature.data is not None:
                     mm_kwargs.append((feature.modality, feature.data))
 
@@ -1661,18 +1635,6 @@ class GPUModelRunner(
             pin_memory=self.pin_memory,
         ):
             mm_kwargs_combined.update(mm_kwargs_batch)
-
-        if include_runtime_request_metadata and runtime_request_num_scheduled_tokens:
-            mm_kwargs_combined["runtime_request_num_scheduled_tokens"] = torch.tensor(
-                runtime_request_num_scheduled_tokens,
-                dtype=torch.int32,
-                device=self.device,
-            )
-            mm_kwargs_combined["runtime_request_has_raw_mm_inputs"] = torch.tensor(
-                runtime_request_has_raw_mm_inputs,
-                dtype=torch.bool,
-                device=self.device,
-            )
 
         return mm_kwargs_combined
 
@@ -3436,33 +3398,24 @@ class GPUModelRunner(
             ) as ec_connector_output:
                 self._execute_mm_encoder(scheduler_output)
                 mm_embeds, is_mm_embed = self._gather_mm_embeddings(scheduler_output)
+
+            # NOTE(woosuk): To unify token ids and soft tokens (vision
+            # embeddings), we always use embeddings (rather than token ids)
+            # as input to the multimodal model, even when the input is text.
+            inputs_embeds_scheduled = self.model.embed_input_ids(
+                self.input_ids.gpu[:num_scheduled_tokens],
+                multimodal_embeddings=mm_embeds,
+                is_multimodal=is_mm_embed,
+            )
+
+            # TODO(woosuk): Avoid the copy. Optimize.
+            self.inputs_embeds.gpu[:num_scheduled_tokens].copy_(inputs_embeds_scheduled)
+
+            input_ids, inputs_embeds = self._prepare_mm_inputs(num_input_tokens)
             model_kwargs = {
                 **self._init_model_kwargs(),
                 **self._extract_mm_kwargs(scheduler_output),
             }
-            if getattr(self.model, "builds_multimodal_inputs_embeds_in_forward", False):
-                # Some models need raw multimodal kwargs plus encoder outputs to
-                # build aligned inputs_embeds inside `forward`, instead of using
-                # the generic text-token-based merge path.
-                input_ids = self.input_ids.gpu[:num_input_tokens]
-                inputs_embeds = None
-                model_kwargs["multimodal_embeddings"] = mm_embeds
-            else:
-                # NOTE(woosuk): To unify token ids and soft tokens (vision
-                # embeddings), we always use embeddings (rather than token ids)
-                # as input to the multimodal model, even when the input is text.
-                inputs_embeds_scheduled = self.model.embed_input_ids(
-                    self.input_ids.gpu[:num_scheduled_tokens],
-                    multimodal_embeddings=mm_embeds,
-                    is_multimodal=is_mm_embed,
-                )
-
-                # TODO(woosuk): Avoid the copy. Optimize.
-                self.inputs_embeds.gpu[:num_scheduled_tokens].copy_(
-                    inputs_embeds_scheduled
-                )
-
-                input_ids, inputs_embeds = self._prepare_mm_inputs(num_input_tokens)
         elif self.enable_prompt_embeds and is_first_rank:
             # Get the input embeddings for the tokens that are not input embeds,
             # then put them into the appropriate positions.

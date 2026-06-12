@@ -23,23 +23,16 @@ except ModuleNotFoundError:
 from vllm.config import ModelConfig, SpeechToTextConfig, VllmConfig
 from vllm.config.multimodal import BaseDummyOptions
 from vllm.config.speech_to_text import SpeechToTextParams
-from vllm.distributed import get_pp_group
 from vllm.inputs import PromptType, TokensPrompt
-from vllm.model_executor.layers.layernorm import RMSNorm
-from vllm.model_executor.layers.logits_processor import LogitsProcessor
-from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 from vllm.model_executor.model_loader import DefaultModelLoader
-from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.interfaces import (
     SupportsMultiModal,
     SupportsPP,
     SupportsTranscription,
 )
 from vllm.model_executor.models.kimi_audio_prompt import KimiAudioPromptBuilder
-from vllm.model_executor.models.qwen2 import Qwen2DecoderLayer
 from vllm.model_executor.models.utils import (
     AutoWeightsLoader,
-    PPMissingLayer,
     WeightsMapper,
     init_vllm_registered_model,
     maybe_prefix,
@@ -71,7 +64,6 @@ from vllm.transformers_utils.processors.kimi_audio import KimiAudioProcessor
 from vllm.transformers_utils.processors.kimi_audio_speech import (
     cached_get_kimi_audio_speech_tokenizer,
 )
-from vllm.v1.sample.metadata import SamplingMetadata
 
 # Kimi-Audio constants
 KIMIA_WHISPER_SUBFOLDER = "whisper-large-v3"
@@ -103,6 +95,11 @@ class KimiAudioWhisperAttention(nn.Module):
         self.embed_dim = config.d_model
         self.num_heads = config.encoder_attention_heads
         self.head_dim = self.embed_dim // self.num_heads
+        if self.head_dim * self.num_heads != self.embed_dim:
+            raise ValueError(
+                "embed_dim must be divisible by num_heads, got "
+                f"embed_dim={self.embed_dim} and num_heads={self.num_heads}."
+            )
         self.scaling = self.head_dim**-0.5
 
         self.q_proj = nn.Linear(self.embed_dim, self.embed_dim, bias=True)
@@ -178,9 +175,7 @@ class KimiAudioWhisperEncoderLayer(nn.Module):
 class KimiAudioWhisperEncoder(nn.Module):
     """Kimi-Audio specific Whisper encoder aligned to the official custom code."""
 
-    def __init__(
-        self, *, vllm_config: VllmConfig, prefix: str = "", init_in_fp32: bool = False
-    ):
+    def __init__(self, *, vllm_config: VllmConfig):
         super().__init__()
         model_path = vllm_config.model_config.model
         whisper_config = HFWhisperConfig.from_pretrained(
@@ -513,7 +508,6 @@ class KimiAudioMultiModalProjector(nn.Module):
         whisper_dim: int = 5120,  # Kimi-Audio custom Whisper encoder dim
         llm_dim: int = 3584,
         norm_eps: float = 1e-6,
-        prefix: str = "",
     ):
         super().__init__()
         self.whisper_dim = whisper_dim
@@ -537,86 +531,6 @@ class KimiAudioMultiModalProjector(nn.Module):
         return hidden
 
 
-class KimiAudioMimoModel(nn.Module):
-    """Kimi-Audio text-output decoder stack kept local to this model."""
-
-    def __init__(self, *, config, vllm_config: VllmConfig, prefix: str = ""):
-        super().__init__()
-        quant_config = vllm_config.quant_config
-        cache_config = vllm_config.cache_config
-
-        self.num_layers = getattr(config, "kimia_mimo_layers", 0)
-        if get_pp_group().is_last_rank and self.num_layers > 0:
-            self.layers = nn.ModuleList(
-                [
-                    Qwen2DecoderLayer(
-                        config=config,
-                        cache_config=cache_config,
-                        quant_config=quant_config,
-                        prefix=f"{prefix}.layers.{idx}",
-                    )
-                    for idx in range(self.num_layers)
-                ]
-            )
-            self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        else:
-            self.layers = nn.ModuleList()
-            self.norm = PPMissingLayer()
-
-    def forward(
-        self, positions: torch.Tensor, hidden_states: torch.Tensor
-    ) -> torch.Tensor:
-        residual = None
-        for layer in self.layers:
-            hidden_states, residual = layer(positions, hidden_states, residual)
-
-        if residual is None:
-            return hidden_states
-
-        hidden_states, _ = self.norm(hidden_states, residual)
-        return hidden_states
-
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        stacked_params_mapping = [
-            ("qkv_proj", "q_proj", "q"),
-            ("qkv_proj", "k_proj", "k"),
-            ("qkv_proj", "v_proj", "v"),
-            ("gate_up_proj", "gate_proj", 0),
-            ("gate_up_proj", "up_proj", 1),
-        ]
-        params_dict = dict(self.named_parameters(remove_duplicate=False))
-        loaded_params: set[str] = set()
-        for name, loaded_weight in weights:
-            if "rotary_emb.inv_freq" in name:
-                continue
-
-            for param_name, weight_name, shard_id in stacked_params_mapping:
-                if weight_name not in name:
-                    continue
-                name = name.replace(weight_name, param_name)
-                if name.endswith(".bias") and name not in params_dict:
-                    continue
-
-                param = params_dict[name]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                if weight_loader == default_weight_loader:
-                    weight_loader(param, loaded_weight)
-                else:
-                    weight_loader(param, loaded_weight, shard_id)
-                break
-            else:
-                if name.endswith(".bias") and name not in params_dict:
-                    continue
-                if name not in params_dict:
-                    continue
-                param = params_dict[name]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(param, loaded_weight)
-
-            loaded_params.add(name)
-        return loaded_params
-
-
 @MULTIMODAL_REGISTRY.register_processor(
     KimiAudioMultiModalProcessor,
     info=KimiAudioProcessingInfo,
@@ -629,9 +543,6 @@ class KimiAudioForConditionalGeneration(
     SupportsTranscription,
 ):
     """Kimi-Audio model for ASR transcription."""
-
-    supports_multimodal_raw_input_only: ClassVar[bool] = False
-    builds_multimodal_inputs_embeds_in_forward: ClassVar[bool] = False
 
     # Kimi-Audio supports a subset of Whisper's supported languages
     supported_languages: ClassVar[Mapping[str, str]] = {
@@ -653,11 +564,7 @@ class KimiAudioForConditionalGeneration(
             # Embeddings and output
             "model.embed_tokens.": "language_model.model.embed_tokens.",
             "model.norm.": "language_model.model.norm.",
-            # Kimi-Audio text-output branch
-            "model.mimo_layers.": "mimo_model.layers.",
-            "model.mimo_norm.": "mimo_model.norm.",
             "lm_head.": "language_model.lm_head.",
-            "mimo_output.": "mimo_output.",
         },
     )
     packed_modules_mapping = {
@@ -687,68 +594,24 @@ class KimiAudioForConditionalGeneration(
             )
         ]
 
-        self.audio_tower = KimiAudioWhisperEncoder(
-            vllm_config=vllm_config,
-            prefix=maybe_prefix(prefix, "audio_tower"),
-        )
-
-        self.multi_modal_projector = KimiAudioMultiModalProjector(
-            whisper_dim=getattr(self.config, "kimia_adaptor_input_dim", 5120),
-            llm_dim=self.config.hidden_size,
-            norm_eps=self.config.rms_norm_eps,
-            prefix=maybe_prefix(prefix, "multi_modal_projector"),
-        )
-
-        self.language_model = init_vllm_registered_model(
-            vllm_config=vllm_config.with_hf_config(
-                self.config, architectures=["Qwen2ForCausalLM"]
-            ),
-            prefix=maybe_prefix(prefix, "language_model"),
-        )
-
-        # Official Kimi-Audio remote code uses lm_head for text tokens and
-        # mimo_output for the audio stream. Keep the MIMO modules loaded for
-        # future audio-output work, but do not route the text-output subset
-        # through them.
-        self.use_mimo_text_path = (
-            get_pp_group().world_size == 1
-            and getattr(self.config, "kimia_mimo_layers", 0) > 0
-        )
-        self.kimia_mimo_transformer_from_layer_index = getattr(
-            self.config,
-            "kimia_mimo_transformer_from_layer_index",
-            -1,
-        )
-        self.mimo_model = KimiAudioMimoModel(
-            config=self.config,
-            vllm_config=vllm_config,
-            prefix=maybe_prefix(prefix, "mimo_model"),
-        )
-        if get_pp_group().is_last_rank:
-            self.mimo_output = ParallelLMHead(
-                self.config.vocab_size,
-                self.config.hidden_size,
-                quant_config=self.quant_config,
-                prefix=maybe_prefix(prefix, "mimo_output"),
+        with self._mark_tower_model(vllm_config, "audio"):
+            self.audio_tower = KimiAudioWhisperEncoder(
+                vllm_config=vllm_config,
             )
-        else:
-            self.mimo_output = PPMissingLayer()
 
-        if self.use_mimo_text_path:
-            tapped_layer = self.kimia_mimo_transformer_from_layer_index + 1
-            start_layer = getattr(self.language_model.model, "start_layer", 0)
-            end_layer = getattr(self.language_model.model, "end_layer", 0)
-            if start_layer < tapped_layer <= end_layer:
-                self.language_model.model._set_aux_hidden_state_layers(
-                    (tapped_layer - start_layer,)
-                )
-            else:
-                self.use_mimo_text_path = False
+            self.multi_modal_projector = KimiAudioMultiModalProjector(
+                whisper_dim=getattr(self.config, "kimia_adaptor_input_dim", 5120),
+                llm_dim=self.config.hidden_size,
+                norm_eps=self.config.rms_norm_eps,
+            )
 
-        self.logits_processor = LogitsProcessor(
-            self.config.vocab_size,
-            self.config.vocab_size,
-        )
+        with self._mark_language_model(vllm_config):
+            self.language_model = init_vllm_registered_model(
+                vllm_config=vllm_config.with_hf_config(
+                    self.config, architectures=["Qwen2ForCausalLM"]
+                ),
+                prefix=maybe_prefix(prefix, "language_model"),
+            )
 
         self.make_empty_intermediate_tensors = (
             self.language_model.make_empty_intermediate_tensors
@@ -1048,21 +911,18 @@ class KimiAudioForConditionalGeneration(
     def compute_logits(
         self,
         hidden_states: torch.Tensor,
-        sampling_metadata: SamplingMetadata | None = None,
     ) -> torch.Tensor | None:
-        if not get_pp_group().is_last_rank:
-            return None
-
-        logits = self.logits_processor(
-            self.language_model.lm_head, hidden_states, sampling_metadata
-        )
-        return logits
+        return self.language_model.compute_logits(hidden_states)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Load weights for the Kimi-Audio text-output subset."""
         skipped_patterns = [
             # Audio tower
             "model.",
+            # Audio-output modules are not used by the text-output subset.
+            "mimo_layers.",
+            "mimo_output.",
+            "mimo_norm.",
         ]
 
         loader = AutoWeightsLoader(self, skip_prefixes=skipped_patterns)

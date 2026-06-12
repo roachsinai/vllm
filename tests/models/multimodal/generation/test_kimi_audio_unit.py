@@ -23,6 +23,7 @@ from vllm.transformers_utils.processors.kimi_audio_whisper_vq import (
     WhisperVQEncoder,
 )
 
+
 def test_kimi_audio_tokenizer_encodes_alignment_special_tokens():
     tokenizer = KimiAudioTokenizer.__new__(KimiAudioTokenizer)
     tokenizer._token_to_id = {}
@@ -169,11 +170,6 @@ def test_kimi_audio_tokenizer_wraps_single_conversation_for_template_render(
     assert prompt == "rendered prompt"
     assert captured["conversations"] == [[{"role": "user", "content": "hello"}]]
     assert "conversation" not in captured["kwargs"]
-
-
-def test_kimi_audio_uses_standard_multimodal_embed_build_for_text_output():
-    assert not KimiAudioForConditionalGeneration.supports_multimodal_raw_input_only
-    assert not KimiAudioForConditionalGeneration.builds_multimodal_inputs_embeds_in_forward
 
 
 def test_kimi_audio_generation_prompt_uses_prompt_builder(monkeypatch):
@@ -433,24 +429,7 @@ class _FakeLanguageModel:
         self.model = _FakeLanguageModelCore()
 
 
-class _FakeTupleLanguageModelCore(_FakeLanguageModelCore):
-    def __call__(self, input_ids, positions, intermediate_tensors, inputs_embeds=None):
-        hidden_states = super().__call__(
-            input_ids,
-            positions,
-            intermediate_tensors,
-            inputs_embeds=inputs_embeds,
-        )
-        return hidden_states, [hidden_states + 10.0]
-
-
-class _FakeTupleLanguageModel:
-    def __init__(self):
-        self.model = _FakeTupleLanguageModelCore()
-        self.lm_head = object()
-
-
-def test_kimi_audio_standard_embed_path_matches_text_output_dual_stream():
+def test_kimi_audio_standard_embed_path_matches_text_output_formula():
     model = object.__new__(KimiAudioForConditionalGeneration)
     model.language_model = SimpleNamespace(
         model=SimpleNamespace(
@@ -605,58 +584,6 @@ def test_kimi_audio_model_process_audio_input_uses_sample_length_post_encoder_tr
     assert captured["feature_length"] == 3000
     assert captured["input_lengths"] is None
     assert audio_embeds[0].shape == (182, 8)
-
-
-def test_kimi_audio_model_keeps_main_hidden_states_for_text_output(monkeypatch):
-    model = object.__new__(KimiAudioForConditionalGeneration)
-    model.language_model = _FakeTupleLanguageModel()
-    model.use_mimo_text_path = True
-    model.mimo_model = lambda positions, hidden_states: hidden_states + 5.0
-
-    monkeypatch.setattr(
-        kimi_audio_model,
-        "get_pp_group",
-        lambda: SimpleNamespace(is_last_rank=True),
-    )
-
-    outputs = KimiAudioForConditionalGeneration.forward(
-        model,
-        input_ids=torch.tensor([[1, 2]], dtype=torch.long),
-        positions=torch.tensor([0, 1], dtype=torch.long),
-    )
-
-    blank = float(KimiAudioProcessor.KIMIA_TEXT_BLANK)
-    expected = torch.tensor([[[1.0 + blank, 1.0 + blank], [2.0 + blank, 2.0 + blank]]])
-    assert torch.allclose(outputs, expected)
-
-
-def test_kimi_audio_model_compute_logits_uses_lm_head_for_text_output(monkeypatch):
-    captured: dict[str, object] = {}
-    model = object.__new__(KimiAudioForConditionalGeneration)
-    model.use_mimo_text_path = True
-    model.mimo_output = object()
-    model.language_model = SimpleNamespace(lm_head=object())
-    model.logits_processor = (
-        lambda lm_head, hidden_states, sampling_metadata: captured.setdefault(
-            "lm_head",
-            lm_head,
-        )
-        or hidden_states
-    )
-
-    monkeypatch.setattr(
-        kimi_audio_model,
-        "get_pp_group",
-        lambda: SimpleNamespace(is_last_rank=True),
-    )
-
-    _ = KimiAudioForConditionalGeneration.compute_logits(
-        model,
-        hidden_states=torch.ones((1, 2, 3)),
-        sampling_metadata=None,
-    )
-
-    assert captured["lm_head"] is model.language_model.lm_head
 
 
 def test_kimi_audio_embed_input_ids_uses_all_multimodal_embeddings():

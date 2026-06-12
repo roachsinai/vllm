@@ -239,17 +239,6 @@ class JinaForRankingConfig(VerifyAndUpdateConfig):
         model_config.hf_config.embedding_size = 512
 
 
-class MoonshotKimiaForCausalLMConfig(VerifyAndUpdateConfig):
-    @staticmethod
-    def verify_and_update_config(vllm_config: "VllmConfig") -> None:
-        # Kimi-Audio text-output requests now follow the standard vLLM
-        # multimodal embedding path: speech token ids are inserted into
-        # `input_ids`, Whisper embeddings are merged by `embed_input_ids`, and
-        # `forward` receives the final `inputs_embeds`. No model-specific
-        # cudagraph override is required for the supported text-output subset.
-        del vllm_config
-
-
 class JinaRobertaModelConfig(VerifyAndUpdateConfig):
     @staticmethod
     def verify_and_update_model_config(model_config: "ModelConfig") -> None:
@@ -621,7 +610,6 @@ MODELS_CONFIG_MAP: dict[str, type[VerifyAndUpdateConfig]] = {
     "LlamaNemotronVLModel": LlamaNemotronVLConfig,
     "Mamba2ForCausalLM": MambaModelConfig,
     "MambaForCausalLM": MambaModelConfig,
-    "MoonshotKimiaForCausalLM": MoonshotKimiaForCausalLMConfig,
     "NemotronHForCausalLM": NemotronHForCausalLMConfig,
     "NemotronHPuzzleForCausalLM": NemotronHForCausalLMConfig,
     "NemotronH_Nano_VL_V2": NemotronHNanoVLV2Config,
