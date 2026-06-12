@@ -16,7 +16,7 @@ import safetensors
 import torch
 import torchaudio
 from huggingface_hub import snapshot_download
-from transformers import AutoModel, WhisperFeatureExtractor
+from transformers import WhisperFeatureExtractor
 
 from vllm.transformers_utils.processors.kimi_audio_whisper_vq import (
     WhisperVQConfig,
@@ -86,16 +86,6 @@ class KimiAudioSpeechTokenizer:
                 resolved_model_path,
                 self.device,
             )
-            if self._model is None:
-                self._model = (
-                    AutoModel.from_pretrained(
-                        resolved_model_path,
-                        trust_remote_code=True,
-                        local_files_only=resolved_model_path != self.model_name_or_path,
-                    )
-                    .eval()
-                    .to(self.device)
-                )
         if self._feature_extractor is None:
             self._feature_extractor = WhisperFeatureExtractor.from_pretrained(
                 resolved_model_path,
