@@ -17,9 +17,9 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 from transformers import WhisperConfig
+from transformers.activations import ACT2FN
 from transformers.modeling_outputs import BaseModelOutput
 from transformers.models.whisper.modeling_whisper import (
-    WhisperEncoderLayer,
     WhisperPreTrainedModel,
 )
 
@@ -135,15 +135,270 @@ class CausalConv1d(nn.Conv1d):
         return super().forward(F.pad(inp, (self.left_padding, 0)))
 
 
+class WhisperAttention(nn.Module):
+    """Minimal Whisper self-attention used by the WhisperVQ encoder."""
+
+    def __init__(
+        self,
+        embed_dim: int,
+        num_heads: int,
+        dropout: float = 0.0,
+        bias: bool = True,
+        is_causal: bool = False,
+    ) -> None:
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.num_heads = num_heads
+        self.dropout = dropout
+        self.head_dim = embed_dim // num_heads
+        if self.head_dim * num_heads != embed_dim:
+            raise ValueError(
+                "embed_dim must be divisible by num_heads, got "
+                f"embed_dim={embed_dim} and num_heads={num_heads}."
+            )
+        self.scaling = self.head_dim**-0.5
+        self.is_causal = is_causal
+
+        self.k_proj = nn.Linear(embed_dim, embed_dim, bias=False)
+        self.v_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
+        self.q_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
+        self.out_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
+
+    def _shape(
+        self,
+        tensor: torch.Tensor,
+        seq_len: int,
+        batch_size: int,
+    ) -> torch.Tensor:
+        return (
+            tensor.view(batch_size, seq_len, self.num_heads, self.head_dim)
+            .transpose(1, 2)
+            .contiguous()
+        )
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+        layer_head_mask: torch.Tensor | None = None,
+        output_attentions: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        batch_size, target_length, _ = hidden_states.size()
+
+        query_states = self._shape(
+            self.q_proj(hidden_states) * self.scaling,
+            target_length,
+            batch_size,
+        )
+        key_states = self._shape(
+            self.k_proj(hidden_states),
+            -1,
+            batch_size,
+        )
+        value_states = self._shape(
+            self.v_proj(hidden_states),
+            -1,
+            batch_size,
+        )
+
+        attn_weights = torch.matmul(query_states, key_states.transpose(2, 3))
+        if attention_mask is not None:
+            attn_weights = attn_weights + attention_mask[..., :key_states.shape[-2]]
+
+        attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(
+            query_states.dtype
+        )
+        if layer_head_mask is not None:
+            if layer_head_mask.size() != (self.num_heads,):
+                raise ValueError(
+                    "Head mask for a single layer should be of size "
+                    f"{(self.num_heads,)}, but is {layer_head_mask.size()}."
+                )
+            attn_weights = layer_head_mask.view(1, -1, 1, 1) * attn_weights
+
+        attn_probs = F.dropout(
+            attn_weights,
+            p=self.dropout,
+            training=self.training,
+        )
+        attn_output = torch.matmul(attn_probs, value_states)
+        if attn_output.size() != (
+            batch_size,
+            self.num_heads,
+            target_length,
+            self.head_dim,
+        ):
+            raise ValueError(
+                "`attn_output` should be of size "
+                f"{(batch_size, self.num_heads, target_length, self.head_dim)}, "
+                f"but is {attn_output.size()}."
+            )
+
+        attn_output = attn_output.transpose(1, 2)
+        attn_output = attn_output.reshape(batch_size, target_length, self.embed_dim)
+        attn_output = self.out_proj(attn_output)
+        return attn_output, attn_weights if output_attentions else None
+
+
+class WhisperSdpaAttention(WhisperAttention):
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+        layer_head_mask: torch.Tensor | None = None,
+        output_attentions: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        if output_attentions or layer_head_mask is not None:
+            return super().forward(
+                hidden_states,
+                attention_mask=attention_mask,
+                layer_head_mask=layer_head_mask,
+                output_attentions=output_attentions,
+            )
+
+        batch_size, target_length, _ = hidden_states.size()
+        query_states = self._shape(
+            self.q_proj(hidden_states),
+            target_length,
+            batch_size,
+        )
+        key_states = self._shape(
+            self.k_proj(hidden_states),
+            -1,
+            batch_size,
+        )
+        value_states = self._shape(
+            self.v_proj(hidden_states),
+            -1,
+            batch_size,
+        )
+
+        causal_mask = attention_mask
+        if causal_mask is not None:
+            causal_mask = causal_mask[..., :key_states.shape[-2]]
+        is_causal = self.is_causal and causal_mask is None and target_length > 1
+
+        attn_output = F.scaled_dot_product_attention(
+            query_states,
+            key_states,
+            value_states,
+            attn_mask=causal_mask,
+            dropout_p=self.dropout if self.training else 0.0,
+            is_causal=is_causal,
+        )
+        if attn_output.size() != (
+            batch_size,
+            self.num_heads,
+            target_length,
+            self.head_dim,
+        ):
+            raise ValueError(
+                "`attn_output` should be of size "
+                f"{(batch_size, self.num_heads, target_length, self.head_dim)}, "
+                f"but is {attn_output.size()}."
+            )
+
+        attn_output = attn_output.transpose(1, 2)
+        attn_output = attn_output.reshape(batch_size, target_length, self.embed_dim)
+        attn_output = self.out_proj(attn_output)
+        return attn_output, None
+
+
+WHISPER_ATTENTION_CLASSES = {
+    "eager": WhisperAttention,
+    "sdpa": WhisperSdpaAttention,
+}
+
+
+class WhisperVQEncoderLayer(nn.Module):
+
+    def __init__(self, config: WhisperVQConfig, is_causal: bool = False):
+        super().__init__()
+        self.embed_dim = config.d_model
+        attn_cls = WHISPER_ATTENTION_CLASSES.get(config._attn_implementation)
+        if attn_cls is None:
+            raise ValueError(
+                "WhisperVQ supports only eager or sdpa attention, got "
+                f"{config._attn_implementation!r}."
+            )
+        self.self_attn = attn_cls(
+            embed_dim=self.embed_dim,
+            num_heads=config.encoder_attention_heads,
+            dropout=config.attention_dropout,
+            is_causal=is_causal,
+        )
+        self.is_causal = is_causal
+        self.self_attn_layer_norm = nn.LayerNorm(self.embed_dim)
+        self.dropout = config.dropout
+        self.activation_fn = ACT2FN[config.activation_function]
+        self.activation_dropout = config.activation_dropout
+        self.fc1 = nn.Linear(self.embed_dim, config.encoder_ffn_dim)
+        self.fc2 = nn.Linear(config.encoder_ffn_dim, self.embed_dim)
+        self.final_layer_norm = nn.LayerNorm(self.embed_dim)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: torch.Tensor,
+        layer_head_mask: torch.Tensor | None = None,
+        output_attentions: bool = False,
+    ) -> tuple[torch.Tensor, ...]:
+        residual = hidden_states
+        hidden_states = self.self_attn_layer_norm(hidden_states)
+        hidden_states, attn_weights = self.self_attn(
+            hidden_states=hidden_states,
+            attention_mask=attention_mask if not self.is_causal else None,
+            layer_head_mask=layer_head_mask,
+            output_attentions=output_attentions,
+        )
+        hidden_states = F.dropout(
+            hidden_states,
+            p=self.dropout,
+            training=self.training,
+        )
+        hidden_states = residual + hidden_states
+
+        residual = hidden_states
+        hidden_states = self.final_layer_norm(hidden_states)
+        hidden_states = self.activation_fn(self.fc1(hidden_states))
+        hidden_states = F.dropout(
+            hidden_states,
+            p=self.activation_dropout,
+            training=self.training,
+        )
+        hidden_states = self.fc2(hidden_states)
+        hidden_states = F.dropout(
+            hidden_states,
+            p=self.dropout,
+            training=self.training,
+        )
+        hidden_states = residual + hidden_states
+
+        if hidden_states.dtype == torch.float16 and (
+            torch.isinf(hidden_states).any() or torch.isnan(hidden_states).any()
+        ):
+            clamp_value = torch.finfo(hidden_states.dtype).max - 1000
+            hidden_states = torch.clamp(
+                hidden_states,
+                min=-clamp_value,
+                max=clamp_value,
+            )
+
+        outputs: tuple[torch.Tensor, ...] = (hidden_states,)
+        if output_attentions:
+            assert attn_weights is not None
+            outputs += (attn_weights,)
+        return outputs
+
+
 class WhisperVQEncoder(WhisperPreTrainedModel):
     config_class = WhisperVQConfig
 
     def __init__(self, config: WhisperVQConfig):
         if not getattr(config, "_attn_implementation", None):
             config._attn_implementation = (
-                "sdpa"
-                if hasattr(torch.nn.functional, "scaled_dot_product_attention")
-                else "eager"
+                "sdpa" if hasattr(F, "scaled_dot_product_attention") else "eager"
             )
         super().__init__(config)
         self.config = config
@@ -179,9 +434,22 @@ class WhisperVQEncoder(WhisperPreTrainedModel):
             if config.quantize_encoder_only
             else config.encoder_layers
         )
-        self.layers = nn.ModuleList(
-            [WhisperEncoderLayer(config) for _ in range(num_layers)]
-        )
+        self.layers = nn.ModuleList([
+            WhisperVQEncoderLayer(
+                config,
+                is_causal=(
+                    config.encoder_causal_attention
+                    or (
+                        config.quantize_causal_encoder
+                        and (
+                            config.quantize_encoder_only
+                            or layer_idx < config.quantize_position
+                        )
+                    )
+                ),
+            )
+            for layer_idx in range(num_layers)
+        ])
         self.layer_norm = (
             None
             if config.quantize_encoder_only
