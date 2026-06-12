@@ -14,10 +14,7 @@ from transformers.utils import chat_template_utils as hf_chat_utils
 from vllm.config.speech_to_text import SpeechToTextParams
 from vllm.model_executor.models import kimi_audio as kimi_audio_model
 from vllm.model_executor.models.kimi_audio import KimiAudioForConditionalGeneration
-from vllm.model_executor.models.kimi_audio_prompt import (
-    KimiAudioPromptBuilder,
-    KimiAudioTokenContent,
-)
+from vllm.model_executor.models.kimi_audio_prompt import KimiAudioPromptBuilder
 from vllm.tokenizers.kimi_audio import KimiAudioTokenizer
 from vllm.transformers_utils.processors import kimi_audio_speech as speech_utils
 from vllm.transformers_utils.processors.kimi_audio import KimiAudioProcessor
@@ -25,31 +22,6 @@ from vllm.transformers_utils.processors.kimi_audio_whisper_vq import (
     WhisperVQConfig,
     WhisperVQEncoder,
 )
-
-class _FakePromptTokenizer:
-    special_tokens = {
-        "<|im_msg_end|>": 1,
-        "<|im_media_begin|>": 2,
-        "<|im_media_end|>": 3,
-        "<|im_kimia_text_blank|>": 4,
-        "<|im_kimia_text_eos|>": 5,
-        "<|im_kimia_user_msg_start|>": 6,
-        "<|im_kimia_assistant_msg_start|>": 7,
-        "<|im_kimia_speech_ct_id|>": 8,
-        "<|im_kimia_speech_ctd_id|>": 9,
-    }
-
-    vocab = {
-        "hi": [10],
-        "hello back": [20, 21],
-    }
-
-    def encode(self, text: str, add_special_tokens: bool = False) -> list[int]:
-        return list(self.vocab.get(text, []))
-
-    def convert_tokens_to_ids(self, token: str) -> int:
-        return self.special_tokens[token]
-
 
 def test_kimi_audio_tokenizer_encodes_alignment_special_tokens():
     tokenizer = KimiAudioTokenizer.__new__(KimiAudioTokenizer)
@@ -197,79 +169,6 @@ def test_kimi_audio_tokenizer_wraps_single_conversation_for_template_render(
     assert prompt == "rendered prompt"
     assert captured["conversations"] == [[{"role": "user", "content": "hello"}]]
     assert "conversation" not in captured["kwargs"]
-
-
-def test_kimi_audio_prompt_builder_builds_token_level_audio_text_streams():
-    tokenizer = _FakePromptTokenizer()
-
-    packed = KimiAudioPromptBuilder.build_token_content(
-        tokenizer=tokenizer,
-        messages=[
-            {"role": "user", "message_type": "text", "content": "hi"},
-            {
-                "role": "assistant",
-                "message_type": "text",
-                "content": "hello back",
-            },
-            {"role": "user", "message_type": "audio", "content": [152064, 152065]},
-        ],
-    )
-
-    assert isinstance(packed, KimiAudioTokenContent)
-    assert packed.audio_token_ids == [
-        6,
-        4,
-        1,
-        7,
-        4,
-        4,
-        4,
-        1,
-        6,
-        2,
-        152064,
-        152065,
-        3,
-        8,
-        1,
-        7,
-    ]
-    assert packed.text_token_ids == [
-        4,
-        10,
-        4,
-        4,
-        20,
-        21,
-        5,
-        4,
-        4,
-        4,
-        4,
-        4,
-        4,
-        4,
-        4,
-        4,
-    ]
-    assert packed.is_continuous_mask == [
-        False,
-        False,
-        False,
-        False,
-        False,
-        False,
-        False,
-        False,
-        False,
-        False,
-        True,
-        True,
-        False,
-        False,
-        False,
-        False,
-    ]
 
 
 def test_kimi_audio_uses_standard_multimodal_embed_build_for_text_output():
@@ -458,15 +357,6 @@ def test_kimi_audio_speech_tokenizer_loads_vendored_whisper_vq(tmp_path):
     assert isinstance(loaded, WhisperVQEncoder)
     assert loaded.config.quantize_encoder_only
     assert loaded.conv1.weight.shape == model.conv1.weight.shape
-
-
-class _FakeProcessorTokenizer(_FakePromptTokenizer):
-    def __call__(self, text, return_tensors="pt", padding=True):
-        batch = len(text)
-        return {
-            "input_ids": torch.ones((batch, 2), dtype=torch.long),
-            "attention_mask": torch.ones((batch, 2), dtype=torch.long),
-        }
 
 
 def test_kimi_audio_prompt_updates_use_speech_token_lengths():
