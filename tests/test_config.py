@@ -227,7 +227,7 @@ def test_with_hf_config_leaves_unknown_model_type_without_architectures(
     assert updated.model_config.hf_config.architectures is None
 
 
-def test_kimi_audio_disables_cudagraphs():
+def test_kimi_audio_preserves_cudagraph_mode_for_text_output():
     compilation_config = CompilationConfig(
         mode=CompilationMode.VLLM_COMPILE,
         cudagraph_mode=CUDAGraphMode.FULL_AND_PIECEWISE,
@@ -242,7 +242,7 @@ def test_kimi_audio_disables_cudagraphs():
     MoonshotKimiaForCausalLMConfig.verify_and_update_config(vllm_config)
 
     assert compilation_config.mode == CompilationMode.VLLM_COMPILE
-    assert compilation_config.cudagraph_mode == CUDAGraphMode.NONE
+    assert compilation_config.cudagraph_mode == CUDAGraphMode.FULL_AND_PIECEWISE
 
 
 def test_async_scheduling_with_pipeline_parallelism_is_allowed():
