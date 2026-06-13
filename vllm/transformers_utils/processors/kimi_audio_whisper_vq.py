@@ -179,9 +179,7 @@ class WhisperAttention(nn.Module):
         self,
         hidden_states: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
-        layer_head_mask: torch.Tensor | None = None,
-        output_attentions: bool = False,
-    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+    ) -> torch.Tensor:
         batch_size, target_length, _ = hidden_states.size()
 
         query_states = self._shape(
@@ -207,13 +205,6 @@ class WhisperAttention(nn.Module):
         attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(
             query_states.dtype
         )
-        if layer_head_mask is not None:
-            if layer_head_mask.size() != (self.num_heads,):
-                raise ValueError(
-                    "Head mask for a single layer should be of size "
-                    f"{(self.num_heads,)}, but is {layer_head_mask.size()}."
-                )
-            attn_weights = layer_head_mask.view(1, -1, 1, 1) * attn_weights
 
         attn_probs = F.dropout(
             attn_weights,
@@ -236,7 +227,7 @@ class WhisperAttention(nn.Module):
         attn_output = attn_output.transpose(1, 2)
         attn_output = attn_output.reshape(batch_size, target_length, self.embed_dim)
         attn_output = self.out_proj(attn_output)
-        return attn_output, attn_weights if output_attentions else None
+        return attn_output
 
 
 class WhisperSdpaAttention(WhisperAttention):
@@ -245,17 +236,7 @@ class WhisperSdpaAttention(WhisperAttention):
         self,
         hidden_states: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
-        layer_head_mask: torch.Tensor | None = None,
-        output_attentions: bool = False,
-    ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        if output_attentions or layer_head_mask is not None:
-            return super().forward(
-                hidden_states,
-                attention_mask=attention_mask,
-                layer_head_mask=layer_head_mask,
-                output_attentions=output_attentions,
-            )
-
+    ) -> torch.Tensor:
         batch_size, target_length, _ = hidden_states.size()
         query_states = self._shape(
             self.q_proj(hidden_states),
@@ -301,7 +282,7 @@ class WhisperSdpaAttention(WhisperAttention):
         attn_output = attn_output.transpose(1, 2)
         attn_output = attn_output.reshape(batch_size, target_length, self.embed_dim)
         attn_output = self.out_proj(attn_output)
-        return attn_output, None
+        return attn_output
 
 
 WHISPER_ATTENTION_CLASSES = {
@@ -340,16 +321,12 @@ class WhisperVQEncoderLayer(nn.Module):
         self,
         hidden_states: torch.Tensor,
         attention_mask: torch.Tensor,
-        layer_head_mask: torch.Tensor | None = None,
-        output_attentions: bool = False,
-    ) -> tuple[torch.Tensor, ...]:
+    ) -> torch.Tensor:
         residual = hidden_states
         hidden_states = self.self_attn_layer_norm(hidden_states)
-        hidden_states, attn_weights = self.self_attn(
+        hidden_states = self.self_attn(
             hidden_states=hidden_states,
             attention_mask=attention_mask if not self.is_causal else None,
-            layer_head_mask=layer_head_mask,
-            output_attentions=output_attentions,
         )
         hidden_states = F.dropout(
             hidden_states,
@@ -384,11 +361,7 @@ class WhisperVQEncoderLayer(nn.Module):
                 max=clamp_value,
             )
 
-        outputs: tuple[torch.Tensor, ...] = (hidden_states,)
-        if output_attentions:
-            assert attn_weights is not None
-            outputs += (attn_weights,)
-        return outputs
+        return hidden_states
 
 
 class WhisperVQEncoder(WhisperPreTrainedModel):
@@ -402,7 +375,6 @@ class WhisperVQEncoder(WhisperPreTrainedModel):
         super().__init__(config)
         self.config = config
         self.dropout = config.dropout
-        self.layerdrop = config.encoder_layerdrop
 
         embed_dim = config.d_model
         self.num_mel_bins = config.num_mel_bins
@@ -566,12 +538,7 @@ class WhisperVQEncoder(WhisperPreTrainedModel):
         self,
         input_features: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
-        head_mask: torch.Tensor | None = None,
-        output_attentions: bool | None = None,
-        output_hidden_states: bool | None = None,
-        return_dict: bool | None = None,
-        quantized_token_ids: torch.LongTensor | None = None,
-    ):
+    ) -> QuantizedBaseModelOutput:
         batch_size, _, seq_length = input_features.shape
         stride = self.conv1.stride[0] * self.conv2.stride[0]
         seq_length = seq_length // stride
@@ -595,20 +562,6 @@ class WhisperVQEncoder(WhisperPreTrainedModel):
                 (batch_size, seq_length),
             )
 
-        output_attentions = (
-            output_attentions
-            if output_attentions is not None
-            else self.config.output_attentions
-        )
-        output_hidden_states = (
-            output_hidden_states
-            if output_hidden_states is not None
-            else self.config.output_hidden_states
-        )
-        return_dict = (
-            return_dict if return_dict is not None else self.config.use_return_dict
-        )
-
         inputs_embeds = F.gelu(self.conv1(input_features))
         inputs_embeds = F.gelu(self.conv2(inputs_embeds))
         hidden_states = inputs_embeds.permute(0, 2, 1)
@@ -619,36 +572,10 @@ class WhisperVQEncoder(WhisperPreTrainedModel):
             training=self.training,
         )
 
-        encoder_states = () if output_hidden_states else None
-        all_attentions = () if output_attentions else None
-
-        if head_mask is not None:
-            assert head_mask.size()[0] == len(self.layers), (
-                "The head_mask should be specified for "
-                f"{len(self.layers)} layers, but got {head_mask.size()[0]}."
-            )
+        quantized_token_ids: torch.LongTensor | None = None
 
         for idx, encoder_layer in enumerate(self.layers):
-            if output_hidden_states:
-                encoder_states = encoder_states + (hidden_states,)
-
-            to_drop = self.training and torch.rand([]) < self.layerdrop
-
-            if to_drop:
-                layer_outputs = (None, None)
-            else:
-                layer_outputs = encoder_layer(
-                    hidden_states,
-                    extended_attention_mask,
-                    layer_head_mask=(
-                        head_mask[idx] if head_mask is not None else None
-                    ),
-                    output_attentions=output_attentions,
-                )
-                hidden_states = layer_outputs[0]
-
-            if output_attentions:
-                all_attentions = all_attentions + (layer_outputs[1],)
+            hidden_states = encoder_layer(hidden_states, extended_attention_mask)
 
             if (
                 idx + 1 == self.config.pooling_position
@@ -694,42 +621,23 @@ class WhisperVQEncoder(WhisperPreTrainedModel):
             ):
                 assert self.codebook is not None
                 assert self.embed_positions2 is not None
-                if quantized_token_ids is not None:
-                    hidden_states = self.codebook(quantized_token_ids)
-                else:
-                    hidden_quantized, flat_indices = vector_quantize(
-                        hidden_states,
-                        self.codebook.weight,
-                    )
-                    quantized_token_ids = flat_indices.reshape(
-                        batch_size,
-                        hidden_quantized.shape[1],
-                    )
-                    hidden_states = hidden_quantized
+                hidden_quantized, flat_indices = vector_quantize(
+                    hidden_states,
+                    self.codebook.weight,
+                )
+                quantized_token_ids = flat_indices.reshape(
+                    batch_size,
+                    hidden_quantized.shape[1],
+                )
+                hidden_states = hidden_quantized
                 hidden_states = hidden_states + self.embed_positions2.weight[
                     : hidden_states.shape[1]
                 ]
 
         if self.layer_norm is not None:
             hidden_states = self.layer_norm(hidden_states)
-        if output_hidden_states:
-            encoder_states = encoder_states + (hidden_states,)
-
-        if not return_dict:
-            return tuple(
-                value
-                for value in (
-                    hidden_states,
-                    encoder_states,
-                    all_attentions,
-                    quantized_token_ids,
-                )
-                if value is not None
-            )
 
         return QuantizedBaseModelOutput(
             last_hidden_state=hidden_states,
-            hidden_states=encoder_states,
-            attentions=all_attentions,
             quantized_token_ids=quantized_token_ids,
         )
