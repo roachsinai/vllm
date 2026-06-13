@@ -410,12 +410,6 @@ class KimiAudioMultiModalProcessor(BaseMultiModalProcessor[KimiAudioProcessingIn
                     audio_arrays.append(aud)
             mm_data["audio"] = audio_arrays
 
-        if (
-            processor_kwargs.get("messages") is not None
-            and processor_kwargs.get("output_type", "text") == "text"
-        ):
-            processor_kwargs["return_speech_token_ids"] = True
-
         # Use the context's call_hf_processor for proper handling
         return self.info.ctx.call_hf_processor(
             self.info.get_hf_processor(**mm_kwargs),

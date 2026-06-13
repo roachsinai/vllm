@@ -664,7 +664,39 @@ def test_kimi_audio_embed_input_ids_does_not_spill_embeddings_across_segments():
     assert torch.allclose(embeds, expected)
 
 
-def test_kimi_audio_multimodal_processor_requests_speech_tokens_for_text_output():
+def test_kimi_audio_multimodal_processor_keeps_speech_token_request_explicit():
+    captured = {}
+    processor = object.__new__(kimi_audio_model.KimiAudioMultiModalProcessor)
+    processor.info = SimpleNamespace(
+        get_hf_processor=lambda **kwargs: object(),
+        ctx=SimpleNamespace(
+            call_hf_processor=lambda hf_processor, inputs, kwargs: captured.update(
+                {
+                    "inputs": inputs,
+                    "kwargs": kwargs,
+                }
+            )
+            or kwargs
+        ),
+    )
+
+    _ = kimi_audio_model.KimiAudioMultiModalProcessor._call_hf_processor(
+        processor,
+        prompt="unused",
+        mm_data={"audios": [np.ones(4, dtype=np.float32)]},
+        mm_kwargs={
+            "messages": [{"role": "user", "message_type": "audio"}],
+            "return_speech_token_ids": True,
+        },
+        tok_kwargs={},
+    )
+
+    assert "audio" in captured["inputs"]
+    assert captured["kwargs"]["return_speech_token_ids"] is True
+    assert captured["kwargs"]["messages"] == [{"role": "user", "message_type": "audio"}]
+
+
+def test_kimi_audio_multimodal_processor_does_not_infer_speech_tokens():
     captured = {}
     processor = object.__new__(kimi_audio_model.KimiAudioMultiModalProcessor)
     processor.info = SimpleNamespace(
@@ -689,8 +721,7 @@ def test_kimi_audio_multimodal_processor_requests_speech_tokens_for_text_output(
     )
 
     assert "audio" in captured["inputs"]
-    assert captured["kwargs"]["return_speech_token_ids"] is True
-    assert captured["kwargs"]["messages"] == [{"role": "user", "message_type": "audio"}]
+    assert "return_speech_token_ids" not in captured["kwargs"]
 
 
 def test_kimi_audio_whisper_attention_matches_official_bias_layout():
