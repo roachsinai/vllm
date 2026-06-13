@@ -118,12 +118,15 @@ class KimiAudioProcessor(ProcessorMixin):
         | None = None,
         audio: AudioInput | None = None,
         return_tensors: str = "pt",
-        return_speech_token_ids: bool = False,
+        return_discrete_audio_token_ids: bool | None = None,
         messages: Sequence[dict[str, object]] | None = None,
         output_type: str = "text",
         audio_sampling_rate: int = 16000,
         **kwargs,
     ) -> BatchFeature:
+        if return_discrete_audio_token_ids is None:
+            return_discrete_audio_token_ids = output_type == "text"
+
         if text is not None:
             if not isinstance(text, list):
                 text = [text]
@@ -161,7 +164,7 @@ class KimiAudioProcessor(ProcessorMixin):
         need_speech_tokens = (
             padded_audio
             and self.speech_tokenizer is not None
-            and return_speech_token_ids
+            and return_discrete_audio_token_ids
         )
         if need_speech_tokens:
             speech_tokenizer = self.speech_tokenizer
@@ -171,7 +174,7 @@ class KimiAudioProcessor(ProcessorMixin):
                 sampling_rate=audio_sampling_rate,
             )
 
-        if return_speech_token_ids and speech_token_lists:
+        if return_discrete_audio_token_ids and speech_token_lists:
             audio_inputs.update(self._build_speech_token_tensors(speech_token_lists))
 
         return BatchFeature(

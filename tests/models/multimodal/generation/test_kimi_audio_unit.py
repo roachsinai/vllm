@@ -215,7 +215,6 @@ def test_kimi_audio_generation_prompt_uses_prompt_builder(monkeypatch):
     assert prompt["prompt_token_ids"] == [11, 22, 33]
     assert np.array_equal(prompt["multi_modal_data"]["audio"], audio)
     assert prompt["mm_processor_kwargs"] == {
-        "return_speech_token_ids": True,
         "output_type": "text",
     }
 
@@ -267,7 +266,7 @@ class _FakeSpeechTokenizer:
         return [[152064, 152065], [152066]]
 
 
-def test_kimi_audio_processor_can_return_discrete_speech_tokens():
+def test_kimi_audio_processor_defaults_discrete_audio_tokens_for_text_output():
     processor = KimiAudioProcessor(
         feature_extractor=_FakeFeatureExtractor(),
         tokenizer=_FakeTextTokenizer(),
@@ -277,7 +276,6 @@ def test_kimi_audio_processor_can_return_discrete_speech_tokens():
     outputs = processor(
         text=["hi", "hello"],
         audio=[np.ones(7, dtype=np.float32), np.ones(5, dtype=np.float32)],
-        return_speech_token_ids=True,
     )
 
     assert outputs["whisper_input_features"].shape == (2, 3, 5)
@@ -291,6 +289,24 @@ def test_kimi_audio_processor_can_return_discrete_speech_tokens():
         [1, 1],
         [1, 0],
     ]
+
+
+def test_kimi_audio_processor_can_skip_discrete_audio_tokens_for_non_text_output():
+    processor = KimiAudioProcessor(
+        feature_extractor=_FakeFeatureExtractor(),
+        tokenizer=_FakeTextTokenizer(),
+        speech_tokenizer=_FakeSpeechTokenizer(),
+    )
+
+    outputs = processor(
+        text="hi",
+        audio=np.ones(7, dtype=np.float32),
+        output_type="both",
+    )
+
+    assert outputs["whisper_input_features"].shape == (1, 3, 5)
+    assert "speech_token_ids" not in outputs
+    assert "speech_attention_mask" not in outputs
 
 
 def test_kimi_audio_speech_tokenizer_prefers_local_override(monkeypatch, tmp_path):
@@ -664,7 +680,7 @@ def test_kimi_audio_embed_input_ids_does_not_spill_embeddings_across_segments():
     assert torch.allclose(embeds, expected)
 
 
-def test_kimi_audio_multimodal_processor_keeps_speech_token_request_explicit():
+def test_kimi_audio_multimodal_processor_keeps_discrete_audio_request_explicit():
     captured = {}
     processor = object.__new__(kimi_audio_model.KimiAudioMultiModalProcessor)
     processor.info = SimpleNamespace(
@@ -686,17 +702,17 @@ def test_kimi_audio_multimodal_processor_keeps_speech_token_request_explicit():
         mm_data={"audios": [np.ones(4, dtype=np.float32)]},
         mm_kwargs={
             "messages": [{"role": "user", "message_type": "audio"}],
-            "return_speech_token_ids": True,
+            "return_discrete_audio_token_ids": True,
         },
         tok_kwargs={},
     )
 
     assert "audio" in captured["inputs"]
-    assert captured["kwargs"]["return_speech_token_ids"] is True
+    assert captured["kwargs"]["return_discrete_audio_token_ids"] is True
     assert captured["kwargs"]["messages"] == [{"role": "user", "message_type": "audio"}]
 
 
-def test_kimi_audio_multimodal_processor_does_not_infer_speech_tokens():
+def test_kimi_audio_multimodal_processor_leaves_discrete_audio_default_to_processor():
     captured = {}
     processor = object.__new__(kimi_audio_model.KimiAudioMultiModalProcessor)
     processor.info = SimpleNamespace(
@@ -721,7 +737,7 @@ def test_kimi_audio_multimodal_processor_does_not_infer_speech_tokens():
     )
 
     assert "audio" in captured["inputs"]
-    assert "return_speech_token_ids" not in captured["kwargs"]
+    assert "return_discrete_audio_token_ids" not in captured["kwargs"]
 
 
 def test_kimi_audio_whisper_attention_matches_official_bias_layout():

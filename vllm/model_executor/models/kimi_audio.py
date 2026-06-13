@@ -970,7 +970,6 @@ class KimiAudioForConditionalGeneration(
             prompt_token_ids=prompt_token_ids,
             multi_modal_data={"audio": audio},
             mm_processor_kwargs={
-                "return_speech_token_ids": True,
                 "output_type": "text",
             },
         )
