@@ -483,6 +483,16 @@ class SamplingParams(
             # we need to skip reading cache at this request.
             self.skip_reading_prefix_cache = self.prompt_logprobs is not None
 
+    def add_stop_token_ids(self, stop_token_ids: list[int] | tuple[int, ...]) -> None:
+        if not stop_token_ids:
+            return
+
+        assert self.stop_token_ids is not None
+        self.stop_token_ids = list(
+            dict.fromkeys([*self.stop_token_ids, *stop_token_ids])
+        )
+        self._all_stop_token_ids.update(stop_token_ids)
+
     def _verify_args(self) -> None:
         if not isinstance(self.n, int):
             raise ValueError(f"n must be an int, but is of type {type(self.n)}")
@@ -1022,3 +1032,4 @@ class BeamSearchParams(
     temperature: float = 0.0
     length_penalty: float = 1.0
     include_stop_str_in_output: bool = False
+    stop_token_ids: list[int] | None = None

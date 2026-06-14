@@ -5,6 +5,7 @@ import json
 import time
 from collections.abc import Awaitable, Mapping
 from dataclasses import dataclass, field
+from functools import cached_property
 from http import HTTPStatus
 from typing import Any, ClassVar, Generic, Protocol, TypeAlias, TypeVar
 
@@ -169,6 +170,40 @@ class OpenAIServing(BeamSearchOnlineMixin):
         except Exception:
             # Never fail server startup over the fingerprint.
             self.system_fingerprint = None
+
+    @cached_property
+    def _model_default_stop_token_ids(self) -> tuple[int, ...]:
+        from vllm.model_executor.model_loader import get_model_cls
+
+        model_cls = get_model_cls(self.model_config)
+        get_default_stop_token_ids = getattr(
+            model_cls, "get_default_stop_token_ids", None
+        )
+        if callable(get_default_stop_token_ids):
+            return tuple(
+                get_default_stop_token_ids(
+                    self.model_config,
+                    self.renderer.tokenizer,
+                )
+            )
+        return tuple(getattr(model_cls, "default_stop_token_ids", ()))
+
+    def _apply_model_default_stop_token_ids(
+        self,
+        params: SamplingParams | BeamSearchParams,
+    ) -> None:
+        default_stop_token_ids = self._model_default_stop_token_ids
+        if not default_stop_token_ids:
+            return
+
+        if isinstance(params, SamplingParams):
+            params.add_stop_token_ids(default_stop_token_ids)
+            return
+
+        existing = params.stop_token_ids or []
+        params.stop_token_ids = list(
+            dict.fromkeys([*existing, *default_stop_token_ids])
+        )
 
     @staticmethod
     def create_error_response(

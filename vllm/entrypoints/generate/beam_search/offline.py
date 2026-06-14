@@ -54,7 +54,10 @@ class BeamSearchOfflineMixin(OfflineInferenceMixin):
 
         tokenizer = self.renderer.get_tokenizer()
         eos_token_id = tokenizer.eos_token_id
-        sort_beams_key = create_sort_beams_key_function(eos_token_id, length_penalty)
+        stop_token_ids = set(params.stop_token_ids or [])
+        if not ignore_eos and eos_token_id is not None:
+            stop_token_ids.add(eos_token_id)
+        sort_beams_key = create_sort_beams_key_function(stop_token_ids, length_penalty)
 
         engine_inputs = self._preprocess_cmpl(prompts)
         lora_requests = self._lora_request_to_seq(lora_request, len(engine_inputs))
@@ -157,7 +160,7 @@ class BeamSearchOfflineMixin(OfflineInferenceMixin):
                                     + logprob_obj.logprob,
                                 )
 
-                                if token_id == eos_token_id and not ignore_eos:
+                                if token_id in stop_token_ids:
                                     instance.completed.append(new_beam)
                                 else:
                                     instance_new_beams.append(new_beam)

@@ -21,6 +21,26 @@ from vllm.transformers_utils.repo_utils import hf_api
 logger = init_logger(__name__)
 
 
+def _load_json_file(path: Path) -> dict[str, Any]:
+    if not path.is_file():
+        return {}
+    with open(path, encoding="utf-8") as f:
+        data = json.load(f)
+    if isinstance(data, dict):
+        return data
+    return {}
+
+
+def _normalize_token_ids(value: Any) -> list[int]:
+    if value is None:
+        return []
+    if isinstance(value, int):
+        return [value]
+    if isinstance(value, list):
+        return [token_id for token_id in value if isinstance(token_id, int)]
+    return []
+
+
 def _load_tiktoken_encoding(
     vocab_file: Path, special_tokens: dict[str, int]
 ) -> tuple[Any, dict[str, int]]:
@@ -51,6 +71,18 @@ def _load_tiktoken_encoding(
 
 class KimiAudioTokenizer(TokenizerLike):
     """TikToken tokenizer for Kimi-Audio."""
+
+    _KIMIAUDIO_SPECIAL_TOKEN_NAMES = (
+        "<|im_media_begin|>",
+        "<|im_media_end|>",
+        "<|im_kimia_text_blank|>",
+        "<|im_kimia_text_eos|>",
+        "<|im_msg_end|>",
+        "<|im_kimia_user_msg_start|>",
+        "<|im_kimia_assistant_msg_start|>",
+        "<|im_kimia_speech_ct_id|>",
+        "<|im_kimia_speech_ctd_id|>",
+    )
 
     @classmethod
     def from_pretrained(
@@ -131,17 +163,18 @@ class KimiAudioTokenizer(TokenizerLike):
 
         # Load special tokens from tokenizer_config.json
         special_tokens: dict[str, int] = {}
+        tokenizer_config_data: dict[str, Any] = {}
         tokenizer_config = vocab_file.parent / "tokenizer_config.json"
-        if tokenizer_config.is_file():
-            with open(tokenizer_config, encoding="utf-8") as f:
-                config = json.load(f)
-                # Extract special tokens from added_tokens_decoder
-                added_tokens = config.get("added_tokens_decoder", {})
-                for token_id_str, token_info in added_tokens.items():
-                    token_id = int(token_id_str)
-                    content = token_info.get("content", "")
-                    if content:
-                        special_tokens[content] = token_id
+        tokenizer_config_data = _load_json_file(tokenizer_config)
+        # Extract special tokens from added_tokens_decoder
+        added_tokens = tokenizer_config_data.get("added_tokens_decoder", {})
+        for token_id_str, token_info in added_tokens.items():
+            token_id = int(token_id_str)
+            content = token_info.get("content", "")
+            if content:
+                special_tokens[content] = token_id
+
+        hf_config = _load_json_file(vocab_file.parent / "config.json")
 
         self._tokenizer, self._special_tokens = _load_tiktoken_encoding(
             vocab_file, special_tokens
@@ -161,10 +194,33 @@ class KimiAudioTokenizer(TokenizerLike):
         # Add Kimi-Audio special tokens
         self._add_kimiaudio_special_tokens()
 
-        # Set default special token IDs (will be updated when special tokens are added)
-        self._bos_token_id = 151643  # Kimi-Audio BOS
-        self._eos_token_id = 151644  # Kimi-Audio EOS
-        self._pad_token_id = self._eos_token_id
+        eos_token_ids = _normalize_token_ids(
+            hf_config.get("eos_token_ids") or hf_config.get("eos_token_id")
+        )
+        bos_token_id = hf_config.get("bos_token_id")
+        pad_token_id = hf_config.get("pad_token_id")
+        pad_token = tokenizer_config_data.get("pad_token")
+
+        # Set default special token IDs from official model config files.
+        self._bos_token_id = (
+            bos_token_id
+            if isinstance(bos_token_id, int)
+            else self._token_to_id.get("[BOS]", self._tokenizer.n_vocab - 1)
+        )
+        self._eos_token_id = (
+            eos_token_ids[0]
+            if eos_token_ids
+            else self._token_to_id.get("[EOS]", self._bos_token_id)
+        )
+        self._pad_token_id = (
+            pad_token_id
+            if isinstance(pad_token_id, int)
+            else (
+                self._token_to_id.get(pad_token, self._eos_token_id)
+                if isinstance(pad_token, str)
+                else self._eos_token_id
+            )
+        )
         self._unk_token_id = self._pad_token_id
 
         self._max_chars_per_token = max(
@@ -174,20 +230,11 @@ class KimiAudioTokenizer(TokenizerLike):
     def _add_kimiaudio_special_tokens(self) -> None:
         """Add Kimi-Audio special tokens to the tokenizer."""
         # Tokens should already be in self._special_tokens from tokenizer_config.json
-        # Just add them to added_tokens_decoder for compatibility
-        kimiaudio_special_tokens = {
-            "<|im_media_begin|>": 151661,
-            "<|im_media_end|>": 151663,
-            "<|im_kimia_text_blank|>": 151666,
-            "<|im_kimia_text_eos|>": 151667,
-            "<|im_msg_end|>": 151645,
-            "<|im_kimia_user_msg_start|>": 151670,
-            "<|im_kimia_assistant_msg_start|>": 151671,
-            "<|im_kimia_speech_ct_id|>": 151675,
-            "<|im_kimia_speech_ctd_id|>": 151676,
-        }
-
-        for token_str, token_id in kimiaudio_special_tokens.items():
+        # Just add the Kimi-Audio subset to added_tokens_decoder for compatibility
+        for token_str in self._KIMIAUDIO_SPECIAL_TOKEN_NAMES:
+            token_id = self._special_tokens.get(token_str)
+            if token_id is None:
+                continue
             # Only add if not already present
             if token_id not in self._added_tokens_decoder:
                 self._added_tokens_decoder[token_id] = AddedToken(
@@ -290,17 +337,7 @@ class KimiAudioTokenizer(TokenizerLike):
         # Allow Kimi-Audio special tokens to be encoded
         tokens = self._tokenizer.encode(
             text,
-            allowed_special={
-                "<|im_media_begin|>",
-                "<|im_media_end|>",
-                "<|im_kimia_text_blank|>",
-                "<|im_kimia_text_eos|>",
-                "<|im_msg_end|>",
-                "<|im_kimia_user_msg_start|>",
-                "<|im_kimia_assistant_msg_start|>",
-                "<|im_kimia_speech_ct_id|>",
-                "<|im_kimia_speech_ctd_id|>",
-            },
+            allowed_special=set(self._KIMIAUDIO_SPECIAL_TOKEN_NAMES),
         )
         if truncation:
             tokens = self._maybe_truncate(tokens, max_length)

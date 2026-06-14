@@ -29,6 +29,17 @@ def test_kimi_audio_tokenizer_encodes_alignment_special_tokens():
     tokenizer._token_to_id = {}
     tokenizer._id_to_token = {}
     tokenizer._added_tokens_decoder = {}
+    tokenizer._special_tokens = {
+        "<|im_media_begin|>": 151661,
+        "<|im_media_end|>": 151663,
+        "<|im_kimia_text_blank|>": 151666,
+        "<|im_kimia_text_eos|>": 151667,
+        "<|im_msg_end|>": 151645,
+        "<|im_kimia_user_msg_start|>": 151670,
+        "<|im_kimia_assistant_msg_start|>": 151671,
+        "<|im_kimia_speech_ct_id|>": 151675,
+        "<|im_kimia_speech_ctd_id|>": 151676,
+    }
     tokenizer._unk_token_id = 151644
     tokenizer._add_kimiaudio_special_tokens()
 
@@ -56,6 +67,24 @@ def test_kimi_audio_tokenizer_encodes_alignment_special_tokens():
 
     assert token_ids == [151661, 151666, 151663, 151675, 151667]
     assert tokenizer.convert_tokens_to_ids("<|im_kimia_speech_ctd_id|>") == 151676
+
+
+def test_kimi_audio_official_text_output_token_ids():
+    tokenizer = SimpleNamespace(
+        get_vocab=lambda: {KimiAudioPromptBuilder.TEXT_EOS: 151667}
+    )
+    model_config = SimpleNamespace(
+        hf_config=SimpleNamespace(eos_token_ids=[151644, 151645])
+    )
+
+    assert KimiAudioForConditionalGeneration.get_default_stop_token_ids(
+        model_config,
+        tokenizer,
+    ) == (
+        151667,
+        151644,
+        151645,
+    )
 
 
 def test_kimi_audio_prompt_builder_text_output_audio_message():

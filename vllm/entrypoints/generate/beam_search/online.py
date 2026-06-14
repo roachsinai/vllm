@@ -42,7 +42,10 @@ class BeamSearchOnlineMixin(ABC):
 
         tokenizer = self.renderer.get_tokenizer()
         eos_token_id = tokenizer.eos_token_id
-        sort_beams_key = create_sort_beams_key_function(eos_token_id, length_penalty)
+        stop_token_ids = set(params.stop_token_ids or [])
+        if not ignore_eos and eos_token_id is not None:
+            stop_token_ids.add(eos_token_id)
+        sort_beams_key = create_sort_beams_key_function(stop_token_ids, length_penalty)
 
         if prompt["type"] == "embeds":
             raise NotImplementedError("Embedding prompt not supported for beam search")
@@ -138,33 +141,35 @@ class BeamSearchOnlineMixin(ABC):
                         ]
                     )
 
-            # Handle the token for the end of sentence (EOS)
+            # Handle stop tokens.
             all_beams_token_id = np.array(all_beams_token_id)
             all_beams_logprob = np.array(all_beams_logprob)
 
-            if not ignore_eos:
-                # Get the index position of eos token in all generated results
-                eos_idx = np.where(all_beams_token_id == eos_token_id)[0]
-                for idx in eos_idx:
+            if stop_token_ids:
+                stop_idx = np.where(np.isin(all_beams_token_id, list(stop_token_ids)))[
+                    0
+                ]
+                for idx in stop_idx:
                     current_beam = all_beams[idx // logprobs_num]
                     result = output[idx // logprobs_num]
+                    stop_token_id = int(all_beams_token_id[idx])
                     assert result.outputs[0].logprobs is not None
                     logprobs_entry = result.outputs[0].logprobs[0]
                     completed.append(
                         BeamSearchSequence(
                             orig_prompt=prompt,
-                            tokens=current_beam.tokens + [eos_token_id]
+                            tokens=current_beam.tokens + [stop_token_id]
                             if include_stop_str_in_output
                             else current_beam.tokens,
                             logprobs=current_beam.logprobs + [logprobs_entry],
                             cum_logprob=float(all_beams_logprob[idx]),
                             finish_reason="stop",
-                            stop_reason=eos_token_id,
+                            stop_reason=stop_token_id,
                         )
                     )
-                # After processing, set the log probability of the eos condition
+                # After processing, set the log probability of the stop condition
                 # to negative infinity.
-                all_beams_logprob[eos_idx] = -np.inf
+                all_beams_logprob[stop_idx] = -np.inf
 
             # Processing non-EOS tokens
             # Get indices of the top beam_width probabilities
@@ -195,8 +200,8 @@ class BeamSearchOnlineMixin(ABC):
         best_beams = sorted_completed[:beam_width]
 
         for beam in best_beams:
-            if beam.tokens[-1] == eos_token_id and not ignore_eos:
-                # Skip the eos token in the text.
+            if beam.tokens[-1] in stop_token_ids:
+                # Skip the stop token in the text.
                 tokens = beam.tokens[tokenized_length:-1]
             else:
                 tokens = beam.tokens[tokenized_length:]

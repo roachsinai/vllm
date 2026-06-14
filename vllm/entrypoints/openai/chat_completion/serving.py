@@ -302,6 +302,7 @@ class OpenAIServingChat(OpenAIServing):
                     max_tokens,
                     self.default_sampling_params,
                 )
+            self._apply_model_default_stop_token_ids(sampling_params)
 
             self._log_inputs(
                 sub_request_id,
