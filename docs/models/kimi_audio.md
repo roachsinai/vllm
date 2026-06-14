@@ -7,7 +7,7 @@ vLLM supports the text-output subset of
 ## Supported Use Cases
 
 - Audio-to-text transcription through the OpenAI-compatible
-  `/v1/audio/transcriptions` and `/v1/audio/translations` endpoints.
+  `/v1/audio/transcriptions` endpoint.
 - Audio understanding with text-only responses.
 - Offline generation with audio inputs.
 - Batched text-output inference.
@@ -15,6 +15,9 @@ vLLM supports the text-output subset of
 This implementation intentionally does not support Kimi-Audio audio output
 generation. Requests that require the official audio detokenizer, vocoder, or
 `output_type="both"` path are outside the current vLLM support boundary.
+Kimi-Audio also does not expose a dedicated speech translation mode in the
+official implementation, so `/v1/audio/translations` is not supported for this
+model.
 
 ## Serving
 

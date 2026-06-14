@@ -219,6 +219,38 @@ def test_kimi_audio_generation_prompt_uses_prompt_builder(monkeypatch):
     }
 
 
+def test_kimi_audio_generation_prompt_rejects_translation(monkeypatch):
+    monkeypatch.setattr(
+        kimi_audio_model,
+        "cached_get_tokenizer",
+        lambda *args, **kwargs: pytest.fail("tokenizer should not be loaded"),
+    )
+
+    model_config = SimpleNamespace(
+        tokenizer="unused",
+        tokenizer_mode="kimi_audio",
+        tokenizer_revision=None,
+        trust_remote_code=True,
+    )
+    stt_config = SimpleNamespace(sample_rate=16000)
+
+    with pytest.raises(
+        ValueError,
+        match="Kimi-Audio does not support audio translation",
+    ):
+        KimiAudioForConditionalGeneration.get_generation_prompt(
+            SpeechToTextParams(
+                audio=np.zeros(8, dtype=np.float32),
+                model_config=model_config,
+                stt_config=stt_config,
+                language="zh",
+                task_type="translate",
+                request_prompt="Please translate the audio into English.",
+                to_language="en",
+            )
+        )
+
+
 @pytest.mark.parametrize(
     ("raw_text", "expected"),
     [

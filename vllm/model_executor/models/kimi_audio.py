@@ -946,6 +946,18 @@ class KimiAudioForConditionalGeneration(
         task_type = stt_params.task_type
         request_prompt = stt_params.request_prompt
 
+        if task_type == "translate":
+            raise ValueError(
+                "Kimi-Audio does not support audio translation. "
+                "Use /v1/audio/transcriptions for Kimi-Audio text-output "
+                "requests."
+            )
+        if task_type != "transcribe":
+            raise ValueError(
+                f"Unsupported task_type '{task_type}'. "
+                "Supported task type is 'transcribe'."
+            )
+
         tokenizer = cached_get_tokenizer(
             model_config.tokenizer,
             tokenizer_cls=KimiAudioTokenizer,
@@ -953,12 +965,6 @@ class KimiAudioForConditionalGeneration(
             revision=model_config.tokenizer_revision,
             trust_remote_code=model_config.trust_remote_code,
         )
-
-        if task_type not in ("transcribe", "translate"):
-            raise ValueError(
-                f"Unsupported task_type '{task_type}'. "
-                "Supported task types are 'transcribe' and 'translate'."
-            )
 
         prompt = KimiAudioPromptBuilder.build_transcription_prompt(
             request_prompt=request_prompt,
