@@ -69,24 +69,6 @@ def test_kimi_audio_tokenizer_encodes_alignment_special_tokens():
     assert tokenizer.convert_tokens_to_ids("<|im_kimia_speech_ctd_id|>") == 151676
 
 
-def test_kimi_audio_official_text_output_token_ids():
-    tokenizer = SimpleNamespace(
-        get_vocab=lambda: {KimiAudioPromptBuilder.TEXT_EOS: 151667}
-    )
-    model_config = SimpleNamespace(
-        hf_config=SimpleNamespace(eos_token_ids=[151644, 151645])
-    )
-
-    assert KimiAudioForConditionalGeneration.get_default_stop_token_ids(
-        model_config,
-        tokenizer,
-    ) == (
-        151667,
-        151644,
-        151645,
-    )
-
-
 def test_kimi_audio_prompt_builder_text_output_audio_message():
     multi_audio_placeholder = KimiAudioPromptBuilder.build_audio_placeholder(
         audio_count=2,

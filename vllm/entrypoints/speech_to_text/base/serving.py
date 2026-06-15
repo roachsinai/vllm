@@ -465,7 +465,6 @@ class OpenAISpeechToText(OpenAIServing):
                 max_tokens,
                 self.default_sampling_params,
             )
-        self._apply_model_default_stop_token_ids(sampling_params)
 
         if request.response_format == "verbose_json":
             sampling_params.logprobs = 1

@@ -545,33 +545,6 @@ class KimiAudioForConditionalGeneration(
     }
     supports_transcription: ClassVar[Literal[True]] = True
 
-    @classmethod
-    def get_default_stop_token_ids(
-        cls,
-        model_config: ModelConfig,
-        tokenizer: Any | None,
-    ) -> tuple[int, ...]:
-        stop_token_ids: list[int] = []
-        if tokenizer is not None:
-            get_vocab = getattr(tokenizer, "get_vocab", None)
-            vocab = get_vocab() if callable(get_vocab) else {}
-            text_eos_id = vocab.get(KimiAudioPromptBuilder.TEXT_EOS)
-            if isinstance(text_eos_id, int):
-                stop_token_ids.append(text_eos_id)
-
-        hf_config = model_config.hf_config
-        eos_token_ids = getattr(hf_config, "eos_token_ids", None)
-        if eos_token_ids is None:
-            eos_token_ids = getattr(hf_config, "eos_token_id", None)
-        if isinstance(eos_token_ids, int):
-            stop_token_ids.append(eos_token_ids)
-        elif isinstance(eos_token_ids, Sequence):
-            stop_token_ids.extend(
-                token_id for token_id in eos_token_ids if isinstance(token_id, int)
-            )
-
-        return tuple(dict.fromkeys(stop_token_ids))
-
     hf_to_vllm_mapper = WeightsMapper(
         orig_to_new_prefix={
             # audio tower
