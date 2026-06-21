@@ -61,12 +61,24 @@ from vllm.tokenizers import cached_get_tokenizer
 from vllm.tokenizers.kimi_audio import KimiAudioTokenizer
 from vllm.transformers_utils.processor import cached_feature_extractor_from_config
 from vllm.transformers_utils.processors.kimi_audio import KimiAudioProcessor
-from vllm.transformers_utils.processors.kimi_audio_speech import (
-    cached_get_kimi_audio_speech_tokenizer,
-)
 
 # Kimi-Audio constants
 KIMIA_WHISPER_SUBFOLDER = "whisper-large-v3"
+
+
+def _should_return_discrete_audio_token_ids(kwargs: Mapping[str, object]) -> bool:
+    value = kwargs.get("return_discrete_audio_token_ids")
+    if value is not None:
+        return bool(value)
+    return kwargs.get("output_type", "text") == "text"
+
+
+def _cached_get_kimi_audio_speech_tokenizer(*args, **kwargs):
+    from vllm.transformers_utils.processors.kimi_audio_speech import (
+        cached_get_kimi_audio_speech_tokenizer,
+    )
+
+    return cached_get_kimi_audio_speech_tokenizer(*args, **kwargs)
 
 
 def _get_kimi_audio_token_length(sample_length: int) -> int:
@@ -277,13 +289,16 @@ class KimiAudioProcessingInfo(BaseProcessingInfo):
             self.ctx.model_config,
             subfolder=KIMIA_WHISPER_SUBFOLDER,
         )
+        speech_tokenizer = None
+        if _should_return_discrete_audio_token_ids(kwargs):
+            speech_tokenizer = _cached_get_kimi_audio_speech_tokenizer(
+                getattr(self.ctx.model_config.hf_config, "kimia_token_offset", 152064),
+            )
 
         return KimiAudioProcessor(
             feature_extractor=feature_extractor,
             tokenizer=self.get_tokenizer(),
-            speech_tokenizer=cached_get_kimi_audio_speech_tokenizer(
-                getattr(self.ctx.model_config.hf_config, "kimia_token_offset", 152064),
-            ),
+            speech_tokenizer=speech_tokenizer,
         )
 
     def get_feature_extractor(self, **kwargs: object):
@@ -432,50 +447,85 @@ class KimiAudioMultiModalProcessor(BaseMultiModalProcessor[KimiAudioProcessingIn
         out_mm_kwargs,
     ) -> Sequence[PromptReplacement]:
         """Get prompt updates for audio tokens."""
+        if _should_return_discrete_audio_token_ids(hf_processor_mm_kwargs):
+            return self._get_official_text_output_prompt_updates(out_mm_kwargs)
+        return self._get_transcription_compat_prompt_updates(out_mm_kwargs)
+
+    def _get_transcription_compat_prompt_updates(
+        self,
+        out_mm_kwargs,
+    ) -> Sequence[PromptReplacement]:
+        """Get #36127-compatible Whisper-only prompt updates."""
         out_mm_data = out_mm_kwargs.get_data()
-        speech_attention_mask = out_mm_data.get("speech_attention_mask")
-        speech_token_ids = out_mm_data.get("speech_token_ids")
         feature_attention_mask = out_mm_data.get("feature_attention_mask")
-        audio_sample_lengths = out_mm_data.get("audio_sample_lengths")
 
         prompt_audio_lengths: list[int] = []
-        if speech_attention_mask is not None:
-            prompt_audio_lengths = speech_attention_mask.sum(-1).tolist()
-        elif speech_token_ids is not None:
-            prompt_audio_lengths = speech_token_ids.ne(-1).sum(-1).tolist()
-        elif audio_sample_lengths is not None:
-            prompt_audio_lengths = [
-                _get_kimi_audio_token_length(int(length))
-                for length in audio_sample_lengths.tolist()
-            ]
-        elif feature_attention_mask is not None:
+        if feature_attention_mask is not None:
             prompt_audio_lengths = _get_feat_extract_output_lengths(
                 feature_attention_mask.sum(-1)
             ).tolist()
 
         def get_replacement_kimiaudio(item_idx: int):
-            if speech_token_ids is not None and item_idx < speech_token_ids.shape[0]:
-                token_row = speech_token_ids[item_idx]
-                if speech_attention_mask is not None:
-                    valid_count = int(speech_attention_mask[item_idx].sum().item())
-                    token_row = token_row[:valid_count]
-                else:
-                    token_row = token_row[token_row.ne(-1)]
-                speech_tokens = [int(token) for token in token_row.tolist()]
-                if speech_tokens:
-                    return speech_tokens
-
             num_features = (
                 prompt_audio_lengths[item_idx]
                 if item_idx < len(prompt_audio_lengths)
-                else 376
+                else KimiAudioProcessor.AUDIO_SEQ_LEN
             )
             if num_features == 0:
-                num_features = 376  # Default Kimi-Audio sequence length
+                num_features = KimiAudioProcessor.AUDIO_SEQ_LEN
             # Return the placeholder token ID repeated num_features times
             return [KimiAudioProcessor.KIMIA_TEXT_BLANK] * num_features
 
         # Use the token ID as target (as a list)
+        return [
+            PromptReplacement(
+                modality="audio",
+                target=[KimiAudioProcessor.KIMIA_TEXT_BLANK],
+                replacement=get_replacement_kimiaudio,
+            ),
+        ]
+
+    def _get_official_text_output_prompt_updates(
+        self,
+        out_mm_kwargs,
+    ) -> Sequence[PromptReplacement]:
+        """Get official Kimi-Audio text-output prompt updates."""
+        out_mm_data = out_mm_kwargs.get_data()
+        speech_attention_mask = out_mm_data.get("speech_attention_mask")
+        speech_token_ids = out_mm_data.get("speech_token_ids")
+
+        if speech_token_ids is None:
+            msg = (
+                "Kimi-Audio official text-output mode requires speech_token_ids. "
+                "This usually means the GLM4/VQ speech tokenizer was not run."
+            )
+            raise ValueError(msg)
+
+        def get_replacement_kimiaudio(item_idx: int):
+            if item_idx >= speech_token_ids.shape[0]:
+                msg = (
+                    "Missing Kimi-Audio speech tokens for audio item "
+                    f"{item_idx}; only {speech_token_ids.shape[0]} item(s) "
+                    "were provided."
+                )
+                raise ValueError(msg)
+
+            token_row = speech_token_ids[item_idx]
+            if speech_attention_mask is not None:
+                valid_count = int(speech_attention_mask[item_idx].sum().item())
+                token_row = token_row[:valid_count]
+            else:
+                token_row = token_row[token_row.ne(-1)]
+
+            speech_tokens = [int(token) for token in token_row.tolist()]
+            if not speech_tokens:
+                msg = (
+                    "Kimi-Audio official text-output mode requires non-empty "
+                    f"speech tokens for audio item {item_idx}."
+                )
+                raise ValueError(msg)
+            return speech_tokens
+
         return [
             PromptReplacement(
                 modality="audio",
@@ -794,34 +844,10 @@ class KimiAudioForConditionalGeneration(
         audio_embeds = self._process_audio_input(audio_input)
         return audio_embeds
 
-    def embed_input_ids(
-        self,
-        input_ids: torch.Tensor,
-        multimodal_embeddings: tuple[torch.Tensor, ...] | None = None,
-        *,
-        is_multimodal: torch.Tensor | None = None,
-        handle_oov_mm_token: bool = False,
-    ) -> torch.Tensor:
-        """Embed input IDs and fuse with audio embeddings.
-
-        Kimi-Audio fusion: inputs_embeds = (text_emb + audio_emb) × √2
-
-        For PP compatibility, we use the is_multimodal mask from vLLM engine
-        which is correctly computed per pipeline stage.
-        """
-        blank_audio_ids = torch.full_like(
-            input_ids,
-            fill_value=KimiAudioProcessor.KIMIA_TEXT_BLANK,
-        )
-        token_embeds = self.language_model.model.embed_tokens(input_ids)
-        blank_embeds = self.language_model.model.embed_tokens(blank_audio_ids)
-        inputs_embeds = token_embeds + blank_embeds
-
-        if multimodal_embeddings is None or len(multimodal_embeddings) == 0:
-            return inputs_embeds
-        if is_multimodal is None or not is_multimodal.any():
-            return inputs_embeds
-
+    @staticmethod
+    def _flatten_multimodal_embeddings(
+        multimodal_embeddings: tuple[torch.Tensor, ...],
+    ) -> list[torch.Tensor]:
         embedding_items: list[torch.Tensor] = []
         for embed in multimodal_embeddings:
             if isinstance(embed, (list, tuple)):
@@ -837,30 +863,126 @@ class KimiAudioForConditionalGeneration(
                     embedding_items.extend(embed.unbind(dim=0))
                 else:
                     embedding_items.append(embed)
+        return embedding_items
 
-        if not embedding_items:
-            return inputs_embeds
-
+    @staticmethod
+    def _split_multimodal_positions(
+        is_multimodal: torch.Tensor,
+    ) -> list[torch.Tensor]:
         mm_positions = is_multimodal.nonzero(as_tuple=True)[0]
         if mm_positions.numel() == 0:
-            return inputs_embeds
-
+            return []
         split_points = (mm_positions[1:] != mm_positions[:-1] + 1).nonzero(
             as_tuple=True
         )[0] + 1
-        mm_segments = torch.tensor_split(mm_positions, split_points.tolist())
+        return list(torch.tensor_split(mm_positions, split_points.tolist()))
 
-        for segment_positions, audio_embeds in zip(mm_segments, embedding_items):
+    def embed_input_ids(
+        self,
+        input_ids: torch.Tensor,
+        multimodal_embeddings: tuple[torch.Tensor, ...] | None = None,
+        *,
+        is_multimodal: torch.Tensor | None = None,
+        handle_oov_mm_token: bool = False,
+    ) -> torch.Tensor:
+        """Embed input IDs and fuse with audio embeddings.
+
+        Transcription compatibility keeps the original Whisper-only fusion.
+        Official text-output mode fuses discrete speech token embeddings with
+        Whisper embeddings and the text-blank stream.
+
+        For PP compatibility, we use the is_multimodal mask from vLLM engine
+        which is correctly computed per pipeline stage.
+        """
+        token_embeds = self.language_model.model.embed_tokens(input_ids)
+        if is_multimodal is None or not is_multimodal.any():
+            blank_audio_ids = torch.full_like(
+                input_ids,
+                fill_value=KimiAudioProcessor.KIMIA_TEXT_BLANK,
+            )
+            blank_embeds = self.language_model.model.embed_tokens(blank_audio_ids)
+            return token_embeds + blank_embeds
+
+        mm_segments = self._split_multimodal_positions(is_multimodal)
+        transcription_compat = bool(
+            torch.all(
+                input_ids[is_multimodal] == KimiAudioProcessor.KIMIA_TEXT_BLANK
+            ).item()
+        )
+        if transcription_compat:
+            inputs_embeds = token_embeds
+        else:
+            blank_audio_ids = torch.full_like(
+                input_ids,
+                fill_value=KimiAudioProcessor.KIMIA_TEXT_BLANK,
+            )
+            blank_embeds = self.language_model.model.embed_tokens(blank_audio_ids)
+            inputs_embeds = token_embeds + blank_embeds
+
+        if multimodal_embeddings is None or len(multimodal_embeddings) == 0:
+            if transcription_compat:
+                return inputs_embeds
+            msg = (
+                "Kimi-Audio official text-output mode requires multimodal "
+                "audio embeddings, but none were provided."
+            )
+            raise ValueError(msg)
+
+        embedding_items = self._flatten_multimodal_embeddings(multimodal_embeddings)
+        if not embedding_items:
+            if transcription_compat:
+                return inputs_embeds
+            msg = (
+                "Kimi-Audio official text-output mode requires non-empty "
+                "audio embeddings."
+            )
+            raise ValueError(msg)
+        if not mm_segments:
+            return inputs_embeds
+
+        if not transcription_compat and len(embedding_items) != len(mm_segments):
+            msg = (
+                "Kimi-Audio official text-output mode expected one audio embedding "
+                "segment per multimodal token segment, but got "
+                f"{len(embedding_items)} embedding segment(s) for "
+                f"{len(mm_segments)} multimodal segment(s)."
+            )
+            raise ValueError(msg)
+
+        for segment_idx, (segment_positions, audio_embeds) in enumerate(
+            zip(mm_segments, embedding_items)
+        ):
             if segment_positions.numel() == 0:
                 continue
             if audio_embeds.dim() != 2:
                 audio_embeds = audio_embeds.reshape(-1, audio_embeds.shape[-1])
-            num_to_use = min(int(segment_positions.numel()), int(audio_embeds.shape[0]))
-            if num_to_use <= 0:
+
+            expected = int(segment_positions.numel())
+            actual = int(audio_embeds.shape[0])
+            if transcription_compat:
+                num_to_use = min(expected, actual)
+                if num_to_use <= 0:
+                    continue
+                actual_positions = segment_positions[:num_to_use]
+                used_audio_embeds = audio_embeds[:num_to_use].to(
+                    dtype=inputs_embeds.dtype
+                )
+                text_at_positions = token_embeds[actual_positions].clone()
+                inputs_embeds[actual_positions] = (
+                    used_audio_embeds + text_at_positions
+                ) * (2**0.5)
                 continue
 
-            actual_positions = segment_positions[:num_to_use]
-            used_audio_embeds = audio_embeds[:num_to_use].to(dtype=inputs_embeds.dtype)
+            if actual != expected:
+                msg = (
+                    "Kimi-Audio official text-output audio embedding length "
+                    f"mismatch for segment {segment_idx}: expected {expected} "
+                    f"embedding row(s), got {actual}."
+                )
+                raise ValueError(msg)
+
+            actual_positions = segment_positions
+            used_audio_embeds = audio_embeds.to(dtype=inputs_embeds.dtype)
             speech_at_positions = token_embeds[actual_positions].clone()
             blank_at_positions = blank_embeds[actual_positions].clone()
             inputs_embeds[actual_positions] = (
@@ -976,7 +1098,7 @@ class KimiAudioForConditionalGeneration(
             prompt_token_ids=prompt_token_ids,
             multi_modal_data={"audio": audio},
             mm_processor_kwargs={
-                "output_type": "text",
+                "return_discrete_audio_token_ids": False,
             },
         )
 

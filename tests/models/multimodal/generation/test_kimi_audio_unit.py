@@ -226,7 +226,7 @@ def test_kimi_audio_generation_prompt_uses_prompt_builder(monkeypatch):
     assert prompt["prompt_token_ids"] == [11, 22, 33]
     assert np.array_equal(prompt["multi_modal_data"]["audio"], audio)
     assert prompt["mm_processor_kwargs"] == {
-        "output_type": "text",
+        "return_discrete_audio_token_ids": False,
     }
 
 
@@ -352,6 +352,50 @@ def test_kimi_audio_processor_can_skip_discrete_audio_tokens_for_non_text_output
     assert "speech_attention_mask" not in outputs
 
 
+def test_kimi_audio_processing_info_loads_speech_tokenizer_only_for_official_mode(
+    monkeypatch,
+):
+    feature_extractor = object()
+    text_tokenizer = object()
+    speech_tokenizer = object()
+    info = object.__new__(kimi_audio_model.KimiAudioProcessingInfo)
+    info.ctx = SimpleNamespace(
+        model_config=SimpleNamespace(
+            hf_config=SimpleNamespace(kimia_token_offset=152064),
+        )
+    )
+    info.get_tokenizer = lambda: text_tokenizer
+    monkeypatch.setattr(
+        kimi_audio_model,
+        "cached_feature_extractor_from_config",
+        lambda *args, **kwargs: feature_extractor,
+    )
+    load_calls = []
+
+    def fake_get_speech_tokenizer(offset):
+        load_calls.append(offset)
+        return speech_tokenizer
+
+    monkeypatch.setattr(
+        kimi_audio_model,
+        "_cached_get_kimi_audio_speech_tokenizer",
+        fake_get_speech_tokenizer,
+    )
+
+    transcription_processor = kimi_audio_model.KimiAudioProcessingInfo.get_hf_processor(
+        info,
+        return_discrete_audio_token_ids=False,
+    )
+    official_processor = kimi_audio_model.KimiAudioProcessingInfo.get_hf_processor(
+        info,
+        return_discrete_audio_token_ids=True,
+    )
+
+    assert transcription_processor.speech_tokenizer is None
+    assert official_processor.speech_tokenizer is speech_tokenizer
+    assert load_calls == [152064]
+
+
 def test_kimi_audio_speech_tokenizer_prefers_local_override(monkeypatch, tmp_path):
     local_path = tmp_path / "glm-4-voice-tokenizer"
     local_path.mkdir()
@@ -414,7 +458,7 @@ def test_kimi_audio_speech_tokenizer_loads_vendored_whisper_vq(tmp_path):
     assert loaded.conv1.weight.shape == model.conv1.weight.shape
 
 
-def test_kimi_audio_prompt_updates_use_speech_token_lengths():
+def test_kimi_audio_official_prompt_updates_use_speech_token_lengths():
     processor = object.__new__(kimi_audio_model.KimiAudioMultiModalProcessor)
     out_mm_kwargs = SimpleNamespace(
         get_data=lambda: {
@@ -439,7 +483,7 @@ def test_kimi_audio_prompt_updates_use_speech_token_lengths():
     prompt_updates = kimi_audio_model.KimiAudioMultiModalProcessor._get_prompt_updates(
         processor,
         mm_items=None,
-        hf_processor_mm_kwargs={},
+        hf_processor_mm_kwargs={"return_discrete_audio_token_ids": True},
         out_mm_kwargs=out_mm_kwargs,
     )
 
@@ -449,7 +493,26 @@ def test_kimi_audio_prompt_updates_use_speech_token_lengths():
     assert replacement.replacement(1) == [152066, 152067, 152068]
 
 
-def test_kimi_audio_prompt_updates_can_use_audio_sample_lengths():
+def test_kimi_audio_transcription_prompt_updates_use_feature_attention_mask():
+    processor = object.__new__(kimi_audio_model.KimiAudioMultiModalProcessor)
+    out_mm_kwargs = SimpleNamespace(
+        get_data=lambda: {
+            "feature_attention_mask": torch.ones((1, 1455), dtype=torch.long),
+        }
+    )
+
+    prompt_updates = kimi_audio_model.KimiAudioMultiModalProcessor._get_prompt_updates(
+        processor,
+        mm_items=None,
+        hf_processor_mm_kwargs={"return_discrete_audio_token_ids": False},
+        out_mm_kwargs=out_mm_kwargs,
+    )
+
+    replacement = prompt_updates[0]
+    assert replacement.replacement(0) == [KimiAudioProcessor.KIMIA_TEXT_BLANK] * 189
+
+
+def test_kimi_audio_official_prompt_updates_require_speech_token_ids():
     processor = object.__new__(kimi_audio_model.KimiAudioMultiModalProcessor)
     out_mm_kwargs = SimpleNamespace(
         get_data=lambda: {
@@ -457,15 +520,32 @@ def test_kimi_audio_prompt_updates_can_use_audio_sample_lengths():
         }
     )
 
+    with pytest.raises(ValueError, match="requires speech_token_ids"):
+        kimi_audio_model.KimiAudioMultiModalProcessor._get_prompt_updates(
+            processor,
+            mm_items=None,
+            hf_processor_mm_kwargs={"return_discrete_audio_token_ids": True},
+            out_mm_kwargs=out_mm_kwargs,
+        )
+
+
+def test_kimi_audio_official_prompt_updates_reject_empty_speech_tokens():
+    processor = object.__new__(kimi_audio_model.KimiAudioMultiModalProcessor)
+    out_mm_kwargs = SimpleNamespace(
+        get_data=lambda: {
+            "speech_token_ids": torch.tensor([[-1, -1]], dtype=torch.long),
+        }
+    )
+
     prompt_updates = kimi_audio_model.KimiAudioMultiModalProcessor._get_prompt_updates(
         processor,
         mm_items=None,
-        hf_processor_mm_kwargs={},
+        hf_processor_mm_kwargs={"return_discrete_audio_token_ids": True},
         out_mm_kwargs=out_mm_kwargs,
     )
 
-    replacement = prompt_updates[0]
-    assert replacement.replacement(0) == [KimiAudioProcessor.KIMIA_TEXT_BLANK] * 182
+    with pytest.raises(ValueError, match="non-empty speech tokens"):
+        prompt_updates[0].replacement(0)
 
 
 class _FakeEmbedTokens:
@@ -696,7 +776,7 @@ def test_kimi_audio_embed_input_ids_does_not_spill_embeddings_across_segments():
     input_ids = torch.tensor([10, 11, 12, 13, 14, 15], dtype=torch.long)
     is_multimodal = torch.tensor([False, True, True, False, True, False])
     multimodal_embeddings = (
-        torch.tensor([[100.0, 100.0], [101.0, 101.0], [102.0, 102.0]]),
+        torch.tensor([[100.0, 100.0], [101.0, 101.0]]),
         torch.tensor([[200.0, 200.0]]),
     )
 
@@ -717,6 +797,73 @@ def test_kimi_audio_embed_input_ids_does_not_spill_embeddings_across_segments():
             [13.0 + blank, 13.0 + blank],
             [(14.0 + 200.0) * sqrt2 + blank, (14.0 + 200.0) * sqrt2 + blank],
             [15.0 + blank, 15.0 + blank],
+        ]
+    )
+
+    assert torch.allclose(embeds, expected)
+
+
+def test_kimi_audio_official_embed_input_ids_rejects_length_mismatch():
+    model = object.__new__(KimiAudioForConditionalGeneration)
+    model.language_model = SimpleNamespace(
+        model=SimpleNamespace(
+            embed_tokens=lambda input_ids: (
+                input_ids.unsqueeze(-1).repeat(1, 2).to(torch.float32)
+            )
+        )
+    )
+
+    input_ids = torch.tensor([10, 152064, 152065, 13], dtype=torch.long)
+    is_multimodal = torch.tensor([False, True, True, False])
+    multimodal_embeddings = (torch.tensor([[100.0, 100.0]]),)
+
+    with pytest.raises(ValueError, match="expected 2 embedding row"):
+        KimiAudioForConditionalGeneration.embed_input_ids(
+            model,
+            input_ids=input_ids,
+            multimodal_embeddings=multimodal_embeddings,
+            is_multimodal=is_multimodal,
+        )
+
+
+def test_kimi_audio_transcription_embed_input_ids_keeps_compat_formula():
+    model = object.__new__(KimiAudioForConditionalGeneration)
+    model.language_model = SimpleNamespace(
+        model=SimpleNamespace(
+            embed_tokens=lambda input_ids: (
+                input_ids.unsqueeze(-1).repeat(1, 2).to(torch.float32)
+            )
+        )
+    )
+
+    blank_id = KimiAudioProcessor.KIMIA_TEXT_BLANK
+    input_ids = torch.tensor([10, blank_id, blank_id, 13], dtype=torch.long)
+    is_multimodal = torch.tensor([False, True, True, False])
+    multimodal_embeddings = (
+        torch.tensor(
+            [
+                [100.0, 100.0],
+                [200.0, 200.0],
+                [300.0, 300.0],
+            ]
+        ),
+    )
+
+    embeds = KimiAudioForConditionalGeneration.embed_input_ids(
+        model,
+        input_ids=input_ids,
+        multimodal_embeddings=multimodal_embeddings,
+        is_multimodal=is_multimodal,
+    )
+
+    sqrt2 = 2**0.5
+    blank = float(blank_id)
+    expected = torch.tensor(
+        [
+            [10.0, 10.0],
+            [(blank + 100.0) * sqrt2, (blank + 100.0) * sqrt2],
+            [(blank + 200.0) * sqrt2, (blank + 200.0) * sqrt2],
+            [13.0, 13.0],
         ]
     )
 

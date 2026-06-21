@@ -15,7 +15,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Processor for Kimi-Audio ASR model."""
+"""Processor for Kimi-Audio ASR and text-output modes."""
 
 from collections.abc import Sequence
 
@@ -24,10 +24,6 @@ import torch
 from transformers import BatchFeature, ProcessorMixin
 from transformers.audio_utils import AudioInput
 from transformers.tokenization_utils_base import PreTokenizedInput, TextInput
-
-from vllm.transformers_utils.processors.kimi_audio_speech import (
-    KimiAudioSpeechTokenizer,
-)
 
 
 class KimiAudioProcessor(ProcessorMixin):
@@ -51,7 +47,7 @@ class KimiAudioProcessor(ProcessorMixin):
         self,
         feature_extractor=None,
         tokenizer=None,
-        speech_tokenizer: KimiAudioSpeechTokenizer | None = None,
+        speech_tokenizer=None,
         **kwargs,
     ):
         self.feature_extractor = feature_extractor
