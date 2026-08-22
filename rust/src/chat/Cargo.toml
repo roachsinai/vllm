@@ -7,6 +7,8 @@ license.workspace = true
 [dependencies]
 anyhow.workspace = true
 asynk-strim-attr.workspace = true
+image.workspace = true
+ndarray.workspace = true
 easy-ext.workspace = true
 futures.workspace = true
 half.workspace = true

@@ -102,6 +102,9 @@ pub struct ModelConfig {
     num_local_experts: Option<OneOrManyExpertCount>,
     block_configs: Vec<BlockConfig>,
     text_config: Option<Box<ModelConfig>>,
+    /// InternVL-family composite configs nest the LLM config under
+    /// `llm_config` (the older HF convention) instead of `text_config`.
+    llm_config: Option<Box<ModelConfig>>,
 }
 
 /// Minimal subset of `generation_config.json`.
@@ -168,12 +171,23 @@ pub(super) struct BlockConfig {
 }
 
 impl ModelConfig {
+    /// Return the nested composite LLM config, if any.
+    ///
+    /// Newer HF composite models use `text_config`; InternVL-family configs
+    /// use the older `llm_config` key. `text_config` wins when both exist.
+    fn nested_text_config(&self) -> Option<&Self> {
+        self.text_config
+            .as_deref()
+            .or(self.llm_config.as_deref())
+    }
+
     /// Return the config that the Rust frontend treats as the text/LLM config.
     ///
     /// This is deliberately narrower than Python/transformers: we only support
-    /// either the top-level config itself or a single nested `text_config`.
+    /// either the top-level config itself or a single nested `text_config`
+    /// (or `llm_config`, for InternVL-family configs).
     fn effective_text_config(&self) -> &Self {
-        self.text_config.as_deref().unwrap_or(self)
+        self.nested_text_config().unwrap_or(self)
     }
 
     /// Return the effective Hugging Face `model_type` used by the Rust
@@ -183,7 +197,9 @@ impl ModelConfig {
     /// this type: the top-level config wins, otherwise a single nested
     /// `text_config` may provide the value.
     pub fn model_type(&self) -> Option<&str> {
-        self.model_type.as_deref().or_else(|| self.text_config.as_deref()?.model_type())
+        self.model_type
+            .as_deref()
+            .or_else(|| self.nested_text_config()?.model_type())
     }
 
     /// Return the effective model vocabulary size, following the same
@@ -191,7 +207,7 @@ impl ModelConfig {
     pub fn vocab_size(&self) -> Result<u32> {
         if let Some(vocab_size) = self.vocab_size {
             Ok(vocab_size)
-        } else if let Some(text_config) = self.text_config.as_deref() {
+        } else if let Some(text_config) = self.nested_text_config() {
             text_config.vocab_size()
         } else {
             Err(Error::Tokenizer(
@@ -205,7 +221,7 @@ impl ModelConfig {
     pub(super) fn eos_token_ids(&self) -> &[u32] {
         if let Some(eos_token_id) = self.eos_token_id.as_ref() {
             eos_token_id.as_slice()
-        } else if let Some(text_config) = self.text_config.as_deref() {
+        } else if let Some(text_config) = self.nested_text_config() {
             text_config.eos_token_ids()
         } else {
             &[]

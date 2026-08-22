@@ -14,7 +14,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::Path;
-use std::sync::{Arc, LazyLock};
+use std::sync::{Arc, LazyLock, OnceLock};
 
 use itertools::izip;
 use llm_multimodal::{
@@ -39,6 +39,7 @@ use crate::request::{ChatContent, ChatContentPart, ChatMessage, ChatRequest};
 mod audio;
 mod expand;
 mod image;
+mod internvl;
 mod item;
 mod tensor;
 mod video;
@@ -145,13 +146,36 @@ impl MultimodalModelContext {
     /// Resolve a static model processor spec for one loaded model.
     fn resolve_model_spec(&self) -> Option<&'static dyn ModelProcessorSpec> {
         static REGISTRY: LazyLock<ModelRegistry> = LazyLock::new(ModelRegistry::new);
-        REGISTRY.lookup(&self.metadata())
+        REGISTRY.lookup(&self.metadata()).or_else(|| {
+            // InternVL is not (yet) in the upstream `llm-multimodal` registry;
+            // fall back to the in-tree spec.
+            static INTERNVL_SPEC: internvl::InternVLProcessorSpec = internvl::InternVLProcessorSpec;
+            if INTERNVL_SPEC.matches(&self.metadata()) {
+                Some(&INTERNVL_SPEC)
+            } else {
+                None
+            }
+        })
     }
 
     /// Resolve a static vision preprocessor for one loaded model.
     ///
     /// The vision preprocessor serves both the image and video modalities.
     fn resolve_vision_processor(&self) -> Option<&'static dyn VisionPreProcessor> {
+        // InternVL's preprocessor carries the tokenizer-resolved
+        // `<IMG_CONTEXT>` id so it can emit the shared `image_token_id`
+        // kwarg; it cannot live in the context-free default registry.
+        if internvl::is_internvl(&self.metadata()) {
+            let ctx_token_id = self.tokenizer().token_to_id("<IMG_CONTEXT>")?;
+            static INTERNVL_PROCESSOR: OnceLock<Box<dyn VisionPreProcessor>> = OnceLock::new();
+            return Some(
+                INTERNVL_PROCESSOR
+                    .get_or_init(|| {
+                        Box::new(internvl::InternVLVisionProcessor::new(ctx_token_id as i32))
+                    })
+                    .as_ref(),
+            );
+        }
         static REGISTRY: LazyLock<VisionProcessorRegistry> =
             LazyLock::new(VisionProcessorRegistry::with_defaults);
         REGISTRY.find(&self.model_id, self.model_type.as_deref())
@@ -188,6 +212,9 @@ impl ResolvedMultimodalSpec {
 
     fn primary_key(&self) -> &'static str {
         match self.modality {
+            // InternVL's Python model reads the flat tile concat from the
+            // `pixel_values_flat` kwarg (`MultiModalFieldConfig.flat_from_sizes`).
+            Modality::Image if self.raw.name() == "internvl" => "pixel_values_flat",
             Modality::Image => image::IMAGE_PRIMARY_KEY,
             Modality::Video => video::VIDEO_PRIMARY_KEY,
             Modality::Audio => audio::AUDIO_PRIMARY_KEY,
@@ -1107,3 +1134,4 @@ mod tests {
         assert_eq!(encoded, source);
     }
 }
+

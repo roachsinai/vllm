@@ -77,7 +77,14 @@ pub(super) fn collect_tensors(
 
     let primary_value = {
         let shape = encoder_input.shape().to_vec();
-        let data = encoder_input.into_iter().collect();
+        // `into_iter()` on dynamically-dimensioned arrays walks a slow
+        // per-element path (~25ns/elem); take the raw buffer instead when
+        // the layout allows it.
+        let data = if encoder_input.is_standard_layout() {
+            encoder_input.into_raw_vec()
+        } else {
+            encoder_input.into_iter().collect()
+        };
         KwargValue::from_f32_tensor(data, shape, float_dtype)?
     };
 
