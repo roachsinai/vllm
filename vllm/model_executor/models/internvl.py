@@ -10,6 +10,7 @@
 from abc import abstractmethod
 from collections.abc import Iterable, Mapping, Sequence
 from functools import cached_property
+from pathlib import Path
 from typing import Annotated, Any, Literal, TypeAlias, TypeVar
 
 import torch
@@ -19,10 +20,16 @@ from transformers import BatchFeature, PretrainedConfig
 from vllm.config import VllmConfig
 from vllm.config.multimodal import BaseDummyOptions
 from vllm.inputs import MultiModalDataDict
+from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.quantization.auto_awq import AutoAWQConfig
 from vllm.model_executor.models.intern_vit import (
     InternVisionModel,
+)
+from vllm.model_executor.models.intern_vit_trt import (
+    StandaloneInternVisionModel,
+    build_intern_vit_engine,
+    export_intern_vit_onnx,
 )
 from vllm.model_executor.models.module_mapping import MultiModelKeys
 from vllm.multimodal import MULTIMODAL_REGISTRY
@@ -60,6 +67,8 @@ from .interfaces import (
     SupportsPP,
 )
 from .utils import AutoWeightsLoader, init_vllm_registered_model, maybe_prefix
+
+logger = init_logger(__name__)
 
 
 class InternVLImagePixelInputs(TensorSchema):
@@ -568,6 +577,7 @@ class InternVLChatModel(
         quant_config = vllm_config.quant_config
         multimodal_config = vllm_config.model_config.multimodal_config
 
+        self.vllm_config = vllm_config
         self.config = config
         self.multimodal_config = multimodal_config
         self.use_data_parallel = multimodal_config.mm_encoder_tp_mode == "data"
@@ -631,12 +641,52 @@ class InternVLChatModel(
         else:
             num_hidden_layers = vision_feature_layer + 1
 
+        if self._can_initialize_trt_vit_standalone(quant_config):
+            logger.info(
+                "Initializing standalone InternViT model for TensorRT export."
+            )
+            return StandaloneInternVisionModel(
+                config.vision_config,
+                num_hidden_layers=num_hidden_layers,
+            )
+
         return InternVisionModel(
             config.vision_config,
             quant_config=quant_config,
             num_hidden_layers_override=num_hidden_layers,
             prefix=prefix,
         )
+
+    def _can_initialize_trt_vit_standalone(
+        self,
+        quant_config: QuantizationConfig | None,
+    ) -> bool:
+        if not self._is_trt_vit_enabled():
+            return False
+
+        parallel_config = self.vllm_config.parallel_config
+        if parallel_config.world_size_across_dp != 1:
+            logger.warning(
+                "Skipping InternViT TensorRT because it is only supported for "
+                "single-card runs. Got TP=%d, PP=%d, DP=%d.",
+                parallel_config.tensor_parallel_size,
+                parallel_config.pipeline_parallel_size,
+                parallel_config.data_parallel_size,
+            )
+            return False
+
+        if quant_config is not None:
+            logger.warning("Skipping InternViT TensorRT for quantized models.")
+            return False
+
+        if self.vllm_config.compilation_config.cudagraph_mm_encoder:
+            logger.warning(
+                "InternViT TensorRT is enabled together with encoder CUDA graphs "
+                "(cudagraph_mm_encoder); this combination is untested, the TRT "
+                "engine will run inside the captured CUDA graph."
+            )
+
+        return True
 
     def _init_mlp1(self, config: PretrainedConfig) -> nn.Module:
         vit_hidden_size = config.vision_config.hidden_size
@@ -879,7 +929,106 @@ class InternVLChatModel(
             "track_token",
         ]
         loader = AutoWeightsLoader(self, skip_prefixes=skip_prefixes)
-        return loader.load_weights(weights)
+        loaded_weights = loader.load_weights(weights)
+        self._maybe_init_trt_vision_model()
+        return loaded_weights
+
+    def _trt_vit_config(self) -> dict:
+        additional_config = self.vllm_config.additional_config
+        if not isinstance(additional_config, dict):
+            return {}
+        return additional_config
+
+    def _is_trt_vit_enabled(self) -> bool:
+        value = self._trt_vit_config().get("use_trt_vit", False)
+        if isinstance(value, str):
+            return value.lower() in ("1", "true", "yes", "on")
+        return bool(value)
+
+    def _maybe_init_trt_vision_model(self) -> None:
+        if not self._is_trt_vit_enabled():
+            return
+
+        if not isinstance(self.vision_model, StandaloneInternVisionModel):
+            return
+
+        try:
+            self._init_trt_vision_model()
+        except Exception:
+            logger.exception(
+                "Failed to initialize InternViT TensorRT backend. "
+                "Falling back to PyTorch vision model."
+            )
+
+    def _init_trt_vision_model(self) -> None:
+        from vllm.model_executor.models.intern_vit_trt import InternVisionTRTModel
+
+        assert isinstance(self.vision_model, StandaloneInternVisionModel)
+        trt_config = self._trt_vit_config()
+        vision_config = self.config.vision_config
+        max_batch = max(
+            1,
+            self.vllm_config.scheduler_config.max_num_batched_tokens
+            // self.num_image_token,
+        )
+        min_batch = int(trt_config.get("trt_vit_min_batch", 1))
+        opt_batch = int(trt_config.get("trt_vit_opt_batch", min(max_batch, 8)))
+        opt_batch = max(min_batch, min(opt_batch, max_batch))
+        workspace_gb = float(trt_config.get("trt_vit_workspace_gb", 8.0))
+
+        cache_dir = Path(
+            trt_config.get("trt_vit_cache_dir", "/tmp/vllm_intern_vit_trt")
+        )
+        onnx_path = Path(
+            trt_config.get("trt_vit_onnx_path", cache_dir / "intern_vit.onnx")
+        )
+        engine_path = Path(
+            trt_config.get("trt_vit_engine_path", cache_dir / "intern_vit.engine")
+        )
+        device = next(self.vision_model.parameters()).device
+        dtype = next(self.vision_model.parameters()).dtype
+
+        logger.info(
+            "Building InternViT TensorRT engine: onnx=%s engine=%s "
+            "profile=(%d,%d,%d)",
+            onnx_path,
+            engine_path,
+            min_batch,
+            opt_batch,
+            max_batch,
+        )
+        export_intern_vit_onnx(
+            model=self.vision_model.eval(),
+            output_path=onnx_path,
+            vision_config=vision_config,
+            batch_size=opt_batch,
+            device=device,
+            dtype=dtype,
+        )
+
+        torch.cuda.empty_cache()
+        build_intern_vit_engine(
+            onnx_path=onnx_path,
+            engine_path=engine_path,
+            vision_config=vision_config,
+            min_batch=min_batch,
+            opt_batch=opt_batch,
+            max_batch=max_batch,
+            workspace_gb=workspace_gb,
+        )
+
+        self.vision_model = InternVisionTRTModel(
+            engine_path,
+            device=device,
+            max_input_shape=(
+                max_batch,
+                self.config.vision_config.num_channels,
+                self.config.vision_config.image_size,
+                self.config.vision_config.image_size,
+            ),
+            output_dtype=dtype,
+        )
+        logger.info("Using InternViT TensorRT engine: %s", engine_path)
 
     def get_mm_mapping(self) -> MultiModelKeys:
         """
