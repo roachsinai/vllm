@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import asyncio
+import os
 import time
 from abc import ABC, abstractmethod
 from collections.abc import Mapping, Sequence
@@ -85,9 +86,14 @@ class BaseRenderer(ABC, Generic[_T]):
         pool_workers = config.model_config.renderer_num_workers
         self._executor = ThreadPoolExecutor(max_workers=pool_workers)
 
-        # Separate single-worker executor so tokenization never queues behind
-        # MM preprocessing; must stay single-worker per #38418 (P0/P1 order).
-        self._mm_executor: Executor = ThreadPoolExecutor(max_workers=1)
+        # Separate executor so tokenization never queues behind MM
+        # preprocessing. Upstream keeps this single-worker per #38418
+        # (P0/P1 arrival order); VLLM_MM_PROCESSOR_WORKERS>1 relaxes that
+        # for throughput-oriented serving where strict arrival order into
+        # the engine is not required (PIL decode/resize release the GIL, so
+        # threads parallelize the heavy part).
+        mm_workers = int(os.environ.get("VLLM_MM_PROCESSOR_WORKERS", "1"))
+        self._mm_executor: Executor = ThreadPoolExecutor(max_workers=mm_workers)
 
         # Offload tokenization to the thread pool. The sync
         # ``_tokenize_prompt`` already encapsulates the unified ``__call__``
