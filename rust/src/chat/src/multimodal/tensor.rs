@@ -78,10 +78,19 @@ pub(super) fn collect_tensors(
     let primary_value = {
         let shape = encoder_input.shape().to_vec();
         // `into_iter()` on dynamically-dimensioned arrays walks a slow
-        // per-element path (~25ns/elem); take the raw buffer instead when
-        // the layout allows it.
+        // per-element path; take the raw buffer instead when the layout
+        // allows it.
         let data = if encoder_input.is_standard_layout() {
-            encoder_input.into_raw_vec()
+            let len = encoder_input.len();
+            let (data, offset) = encoder_input.into_raw_vec_and_offset();
+            let start = offset.unwrap_or(0);
+            if start == 0 && data.len() == len {
+                data
+            } else {
+                // Buffer with unused head/tail: copy the used range, which
+                // standard strides place contiguously in logical order.
+                data[start..start + len].to_vec()
+            }
         } else {
             encoder_input.into_iter().collect()
         };
