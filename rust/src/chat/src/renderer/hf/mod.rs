@@ -450,38 +450,95 @@ fn to_template_openai_content(
     }
 }
 
+/// Flatten content parts into a string, mirroring the Python string-content
+/// path (`vllm/entrypoints/chat_utils.py` with `interleave_mm_strings=False`):
+/// media placeholders are front-padded, grouped by modality in first-seen
+/// order; all segments and text parts are joined with `"\n"`, and empty text
+/// parts are dropped.
 fn to_template_string_content(
     content: &ChatContent,
     multimodal: Option<&MultimodalRenderInfo>,
 ) -> Result<String> {
+    #[derive(Clone, Copy, PartialEq)]
+    enum MediaModality {
+        Image,
+        Video,
+        Audio,
+    }
+
+    fn media_token<'a>(
+        multimodal: Option<&'a MultimodalRenderInfo>,
+        extract: fn(&'a MultimodalRenderInfo) -> Option<&'a String>,
+        unsupported: &'static str,
+    ) -> Result<&'a str> {
+        multimodal
+            .and_then(extract)
+            .map(String::as_str)
+            .ok_or(Error::UnsupportedMultimodalContent(unsupported))
+    }
+
+    fn push_media<'a>(
+        media: &mut Vec<(MediaModality, Vec<&'a str>)>,
+        group: MediaModality,
+        token: &'a str,
+    ) {
+        match media.iter_mut().find(|(g, _)| *g == group) {
+            Some((_, tokens)) => tokens.push(token),
+            None => media.push((group, vec![token])),
+        }
+    }
+
     match content {
         ChatContent::Text(text) => Ok(text.clone()),
         ChatContent::Parts(parts) => {
-            let mut out = String::new();
+            let mut texts: Vec<&str> = Vec::new();
+            let mut media: Vec<(MediaModality, Vec<&str>)> = Vec::new();
+
             for part in parts {
                 match part {
-                    ChatContentPart::Text { text } => out.push_str(text),
+                    ChatContentPart::Text { text } => {
+                        if !text.is_empty() {
+                            texts.push(text);
+                        }
+                    }
                     ChatContentPart::ImageUrl { .. } => {
-                        let image_token = multimodal
-                            .and_then(|multimodal| multimodal.image_token.as_ref())
-                            .ok_or(Error::UnsupportedMultimodalContent("image_url"))?;
-                        out.push_str(image_token);
+                        let token = media_token(
+                            multimodal,
+                            |info| info.image_token.as_ref(),
+                            "image_url",
+                        )?;
+                        push_media(&mut media, MediaModality::Image, token);
                     }
                     ChatContentPart::VideoUrl { .. } => {
-                        let video_token = multimodal
-                            .and_then(|multimodal| multimodal.video_token.as_ref())
-                            .ok_or(Error::UnsupportedMultimodalContent("video_url"))?;
-                        out.push_str(video_token);
+                        let token = media_token(
+                            multimodal,
+                            |info| info.video_token.as_ref(),
+                            "video_url",
+                        )?;
+                        push_media(&mut media, MediaModality::Video, token);
                     }
                     ChatContentPart::InputAudio { .. } | ChatContentPart::AudioUrl { .. } => {
-                        let audio_token = multimodal
-                            .and_then(|multimodal| multimodal.audio_token.as_ref())
-                            .ok_or(Error::UnsupportedMultimodalContent("audio"))?;
-                        out.push_str(audio_token);
+                        let token = media_token(
+                            multimodal,
+                            |info| info.audio_token.as_ref(),
+                            "audio",
+                        )?;
+                        push_media(&mut media, MediaModality::Audio, token);
                     }
                 }
             }
-            Ok(out)
+
+            if media.is_empty() {
+                return Ok(texts.join("\n"));
+            }
+
+            let mut segments: Vec<&str> =
+                media.iter().flat_map(|(_, tokens)| tokens.iter().copied()).collect();
+            let text_prompt = texts.join("\n");
+            if !text_prompt.is_empty() {
+                segments.push(&text_prompt);
+            }
+            Ok(segments.join("\n"))
         }
     }
 }
@@ -658,7 +715,9 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(rendered.prompt, Prompt::Text("a<image>b".to_string()));
+        // Media placeholders are front-padded and joined with "\n",
+        // matching Python's string-content flattening.
+        assert_eq!(rendered.prompt, Prompt::Text("<image>\na\nb".to_string()));
     }
 
     #[test]
@@ -670,7 +729,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(rendered.prompt, Prompt::Text("a<video>b".to_string()));
+        assert_eq!(rendered.prompt, Prompt::Text("<video>\na\nb".to_string()));
     }
 
     #[test]
@@ -684,7 +743,63 @@ mod tests {
 
         assert_eq!(
             rendered.prompt,
-            Prompt::Text("a<audio><audio>b".to_string())
+            Prompt::Text("<audio>\n<audio>\na\nb".to_string())
+        );
+    }
+
+    #[test]
+    fn string_content_format_pads_trailing_media_to_front() {
+        let request = sample_request(vec![ChatMessage::user(vec![
+            ChatContentPart::text("a"),
+            ChatContentPart::image_url("data:image/png;base64,test"),
+        ])]);
+
+        let rendered = render_mm(
+            "{{ messages[0].content }}",
+            &request,
+            ChatTemplateContentFormatOption::String,
+        )
+        .unwrap();
+
+        assert_eq!(rendered.prompt, Prompt::Text("<image>\na".to_string()));
+    }
+
+    #[test]
+    fn string_content_format_drops_empty_text_parts() {
+        let request = sample_request(vec![ChatMessage::user(vec![
+            ChatContentPart::text(""),
+            ChatContentPart::text("a"),
+        ])]);
+
+        let rendered = render_mm(
+            "{{ messages[0].content }}",
+            &request,
+            ChatTemplateContentFormatOption::String,
+        )
+        .unwrap();
+
+        assert_eq!(rendered.prompt, Prompt::Text("a".to_string()));
+    }
+
+    #[test]
+    fn string_content_format_groups_media_by_first_seen_modality() {
+        let request = sample_request(vec![ChatMessage::user(vec![
+            ChatContentPart::text("a"),
+            ChatContentPart::image_url("data:image/png;base64,test"),
+            ChatContentPart::input_audio("dGVzdA==", Some("wav".to_string())),
+            ChatContentPart::text("b"),
+        ])]);
+
+        let rendered = render_mm(
+            "{{ messages[0].content }}",
+            &request,
+            ChatTemplateContentFormatOption::String,
+        )
+        .unwrap();
+
+        assert_eq!(
+            rendered.prompt,
+            Prompt::Text("<image>\n<audio>\na\nb".to_string())
         );
     }
 
@@ -897,7 +1012,7 @@ mod tests {
 
         let rendered = render(Some("{{ messages[0].content }}"), &request).unwrap();
 
-        assert_eq!(rendered, "hello world");
+        assert_eq!(rendered, "hello\n world");
     }
 
     #[test]
@@ -1050,7 +1165,7 @@ mod tests {
         .unwrap()
         .prompt;
 
-        assert_eq!(rendered, Prompt::Text("hello world".to_string()));
+        assert_eq!(rendered, Prompt::Text("hello\n world".to_string()));
     }
 
     #[test]
