@@ -11,7 +11,7 @@
 //!   closest to the source aspect ratio, resize the image to
 //!   `(448*i, 448*j)` (PIL-compatible bicubic), crop into 448x448 tiles, and
 //!   append a 448x444 global thumbnail when there is more than one tile;
-//! - per-tile CLIP normalization (OpenAI mean/std);
+//! - per-tile ImageNet normalization (mean/std);
 //! - prompt replacement: the `<img>` placeholder expands to
 //!   `<img>` + `<IMG_CONTEXT>` * (`256 * num_patches`) + `</img>`;
 //! - engine kwargs mirror the Python `MultiModalFieldConfig` declarations of
@@ -23,7 +23,7 @@ use std::collections::HashMap;
 
 use image::{DynamicImage, GenericImageView};
 use llm_multimodal::registry::RegistryResult;
-use llm_multimodal::vision::transforms::{resize_bicubic_pil, to_tensor_and_normalize};
+use llm_multimodal::vision::transforms::resize_bicubic_pil;
 use llm_multimodal::{
     EncoderFieldLayouts, FieldLayout, Modality, ModelMetadata, ModelProcessorSpec,
     ModelSpecificValue, PreprocessedEncoderInputs, PromptReplacement, TokenId, TransformError,
@@ -47,9 +47,11 @@ const MIN_DYNAMIC_PATCH: usize = 1;
 /// Whether to append a global 448x448 thumbnail when tiling.
 const USE_THUMBNAIL: bool = true;
 
-/// OpenAI CLIP normalization used by InternVL checkpoints.
-const CLIP_MEAN: [f64; 3] = [0.48145466, 0.4578275, 0.40821073];
-const CLIP_STD: [f64; 3] = [0.26862954, 0.26130258, 0.27577711];
+/// ImageNet normalization statistics used by InternVL preprocessing
+/// (mirrors the official OpenGVLab implementation and vllm's
+/// `transformers_utils/processors/internvl.py`).
+const IMAGENET_MEAN: [f64; 3] = [0.485, 0.456, 0.406];
+const IMAGENET_STD: [f64; 3] = [0.229, 0.224, 0.225];
 
 /// Candidate tile grids with `min <= i*j <= max`, ordered by tile count.
 ///
@@ -107,13 +109,23 @@ fn num_patches_for(width: u32, height: u32) -> usize {
     patches
 }
 
-/// One normalized tile as `[3, 448, 448]`.
+/// One normalized tile as `[3, 448, 448]`, bit-exact with the Python path
+/// (`torchvision` ToTensor + Normalize): `(pixel / 255 - mean) / std`
+/// evaluated step by step in f32. The algebraically-equivalent fused form
+/// `pixel * (1/(255*std)) - mean/std` perturbs the last mantissa bit.
 fn normalized_tile(tile: &DynamicImage) -> ndarray::Array3<f32> {
-    to_tensor_and_normalize(
-        &DynamicImage::ImageRgb8(tile.to_rgb8()),
-        &CLIP_MEAN,
-        &CLIP_STD,
-    )
+    let rgb = tile.to_rgb8();
+    let (width, height) = (rgb.width() as usize, rgb.height() as usize);
+    let mut out = ndarray::Array3::<f32>::zeros((3, height, width));
+    for channel in 0..3 {
+        let mean = IMAGENET_MEAN[channel] as f32;
+        let std = IMAGENET_STD[channel] as f32;
+        let mut plane = out.slice_mut(ndarray::s![channel, .., ..]);
+        for (index, pixel) in rgb.iter().skip(channel).step_by(3).enumerate() {
+            plane[[index / width, index % width]] = (*pixel as f32 / 255.0 - mean) / std;
+        }
+    }
+    out
 }
 
 /// InternVL vision preprocessor.
@@ -178,11 +190,11 @@ impl InternVLVisionProcessor {
 
 impl VisionPreProcessor for InternVLVisionProcessor {
     fn default_mean(&self) -> [f64; 3] {
-        CLIP_MEAN
+        IMAGENET_MEAN
     }
 
     fn default_std(&self) -> [f64; 3] {
-        CLIP_STD
+        IMAGENET_STD
     }
 
     fn preprocess(
