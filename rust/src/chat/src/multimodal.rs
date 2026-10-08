@@ -26,7 +26,7 @@ use llm_multimodal::{
 };
 use serde::{Deserialize, Serialize};
 use thiserror_ext::AsReport as _;
-use tracing::warn;
+use tracing::{info, warn};
 use vllm_engine_core_client::protocol::dtype::ModelDtype;
 use vllm_engine_core_client::protocol::multimodal::{MmFeatureSpec, MmFeatures, MmKwargsItem};
 use vllm_text::Prompt;
@@ -128,6 +128,10 @@ struct MultimodalModelContext {
     model_type: Option<String>,
     config: serde_json::Value,
     tokenizer: TokenizerResolver,
+    /// Server-side long-edge cap for InternVL preprocessing
+    /// (`additional_config.internvl_resize_long_edge`). Consumed only by the
+    /// in-tree InternVL processor.
+    internvl_resize_long_edge: Option<u32>,
 }
 
 impl MultimodalModelContext {
@@ -167,11 +171,21 @@ impl MultimodalModelContext {
         // kwarg; it cannot live in the context-free default registry.
         if internvl::is_internvl(&self.metadata()) {
             let ctx_token_id = self.tokenizer().token_to_id("<IMG_CONTEXT>")?;
+            if let Some(k) = self.internvl_resize_long_edge {
+                info!(
+                    model_id = self.model_id,
+                    resize_long_edge = k,
+                    "InternVL server-side long-edge resize enabled"
+                );
+            }
             static INTERNVL_PROCESSOR: OnceLock<Box<dyn VisionPreProcessor>> = OnceLock::new();
             return Some(
                 INTERNVL_PROCESSOR
                     .get_or_init(|| {
-                        Box::new(internvl::InternVLVisionProcessor::new(ctx_token_id as i32))
+                        Box::new(internvl::InternVLVisionProcessor::new(
+                            ctx_token_id as i32,
+                            self.internvl_resize_long_edge,
+                        ))
                     })
                     .as_ref(),
             );
@@ -381,6 +395,7 @@ impl MultimodalModelInfo {
         files: MultimodalConfigFiles<'_>,
         tokenizer: DynTokenizer,
         limit_mm_per_prompt: MmLimitPerPrompt,
+        internvl_resize_long_edge: Option<u32>,
     ) -> Result<Option<Self>> {
         let config = match files.config {
             Some(path) => {
@@ -411,6 +426,7 @@ impl MultimodalModelInfo {
             model_type,
             config,
             tokenizer: TokenizerResolver(tokenizer),
+            internvl_resize_long_edge,
         };
 
         Self::from_loaded(
@@ -912,6 +928,7 @@ mod tests {
             model_type: Some(model_type.to_string()),
             config,
             tokenizer: TokenizerResolver(Arc::new(tokenizer)),
+            internvl_resize_long_edge: None,
         };
 
         MultimodalModelInfo::from_loaded(
@@ -1134,4 +1151,3 @@ mod tests {
         assert_eq!(encoded, source);
     }
 }
-

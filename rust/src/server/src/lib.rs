@@ -102,6 +102,7 @@ async fn build_state(config: &Config) -> Result<Arc<AppState>> {
                 .clone()
                 .unwrap_or_default(),
             limit_mm_per_prompt: config.limit_mm_per_prompt.clone(),
+            internvl_resize_long_edge: config.internvl_resize_long_edge,
         },
     )
     .await

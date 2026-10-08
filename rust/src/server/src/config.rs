@@ -188,6 +188,10 @@ pub struct Config {
     /// Maximum number of input items allowed per prompt for each modality.
     /// Unspecified modalities are unlimited.
     pub limit_mm_per_prompt: MmLimitPerPrompt,
+    /// Server-side long-edge cap for InternVL image preprocessing
+    /// (`additional_config.internvl_resize_long_edge`). `None` disables the
+    /// cap.
+    pub internvl_resize_long_edge: Option<u32>,
     /// How to serialize `message.content` for chat-template rendering.
     pub chat_template_content_format: ChatTemplateContentFormatOption,
     /// Optional maximum number of top log probabilities accepted by the

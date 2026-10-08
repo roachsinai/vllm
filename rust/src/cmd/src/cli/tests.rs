@@ -65,6 +65,7 @@ fn serve_args_forward_python_flags_with_separator() {
                         chat_template: None,
                         default_chat_template_kwargs: None,
                         limit_mm_per_prompt: {},
+                        internvl_resize_long_edge: None,
                         chat_template_content_format: Auto,
                         enable_log_requests: false,
                         enable_prompt_tokens_details: false,
@@ -764,6 +765,7 @@ fn frontend_args_accept_json() {
                         chat_template: None,
                         default_chat_template_kwargs: None,
                         limit_mm_per_prompt: {},
+                        internvl_resize_long_edge: None,
                         chat_template_content_format: Auto,
                         enable_log_requests: false,
                         enable_prompt_tokens_details: false,
@@ -950,6 +952,64 @@ fn frontend_args_json_ignores_unknown_fields() {
         panic!("expected frontend args");
     };
     assert_eq!(args.runtime.model, "Qwen/Qwen3-0.6B");
+}
+
+/// Parse `--args-json` with the given `additional_config` object.
+fn frontend_args_json_with_additional_config(
+    additional_config: &str,
+) -> Result<Option<u32>, String> {
+    let args_json = format!(r#"{{"model_tag":"m","additional_config":{additional_config}}}"#);
+    let result = Cli::try_parse_from([
+        "vllm-rs",
+        "frontend",
+        "--listen-fd",
+        "3",
+        "--input-address",
+        "ipc:///tmp/input.sock",
+        "--output-address",
+        "ipc:///tmp/output.sock",
+        "--args-json",
+        &args_json,
+    ]);
+    match result {
+        Ok(cli) => match cli.command {
+            Command::Frontend(args) => Ok(args.runtime.internvl_resize_long_edge),
+            _ => panic!("expected frontend args"),
+        },
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+#[test]
+fn frontend_args_json_parses_internvl_resize_long_edge() {
+    // Explicit cap.
+    assert_eq!(
+        frontend_args_json_with_additional_config(r#"{"internvl_resize_long_edge":2048}"#)
+            .unwrap(),
+        Some(2048)
+    );
+    // Absent key / null / zero all mean "no cap".
+    assert_eq!(
+        frontend_args_json_with_additional_config(r#"{"use_trt_vit":true}"#).unwrap(),
+        None
+    );
+    assert_eq!(
+        frontend_args_json_with_additional_config(r#"{"internvl_resize_long_edge":null}"#)
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        frontend_args_json_with_additional_config(r#"{"internvl_resize_long_edge":0}"#).unwrap(),
+        None
+    );
+    // Wrong type and out-of-range values are rejected.
+    assert!(
+        frontend_args_json_with_additional_config(r#"{"internvl_resize_long_edge":"2048"}"#)
+            .is_err()
+    );
+    assert!(
+        frontend_args_json_with_additional_config(r#"{"internvl_resize_long_edge":-1}"#).is_err()
+    );
 }
 
 #[test]
@@ -1352,6 +1412,7 @@ fn serve_args_accept_handshake_aliases() {
                         chat_template: None,
                         default_chat_template_kwargs: None,
                         limit_mm_per_prompt: {},
+                        internvl_resize_long_edge: None,
                         chat_template_content_format: Auto,
                         enable_log_requests: false,
                         enable_prompt_tokens_details: false,
@@ -1496,6 +1557,7 @@ fn serve_frontend_config_uses_dp_address_as_advertised_host() {
             chat_template: None,
             default_chat_template_kwargs: None,
             limit_mm_per_prompt: {},
+            internvl_resize_long_edge: None,
             chat_template_content_format: Auto,
             max_logprobs: None,
             api_server_options: ApiServerOptions {
@@ -1581,6 +1643,7 @@ fn serve_frontend_config_keeps_tcp_transport_for_non_local_only_topology() {
             chat_template: None,
             default_chat_template_kwargs: None,
             limit_mm_per_prompt: {},
+            internvl_resize_long_edge: None,
             chat_template_content_format: Auto,
             max_logprobs: None,
             api_server_options: ApiServerOptions {
@@ -1684,6 +1747,7 @@ fn frontend_config_uses_external_coordinator_when_coordinator_address_is_present
             chat_template: None,
             default_chat_template_kwargs: None,
             limit_mm_per_prompt: {},
+            internvl_resize_long_edge: None,
             chat_template_content_format: Auto,
             max_logprobs: None,
             api_server_options: ApiServerOptions {

@@ -101,6 +101,7 @@ mod tests {
             model_type: Some("inkling_mm_model".to_string()),
             config,
             tokenizer: TokenizerResolver(Arc::new(tokenizer)),
+            internvl_resize_long_edge: None,
         };
 
         MultimodalModelInfo::from_loaded(
@@ -121,6 +122,7 @@ mod tests {
             tokenizer: TokenizerResolver(Arc::new(
                 TestTokenizer::new().with_regular_token("<|audio_pad|>", AUDIO_PAD_ID),
             )),
+            internvl_resize_long_edge: None,
         };
 
         MultimodalModelInfo::from_loaded(

@@ -198,6 +198,20 @@ pub struct SharedRuntimeArgs {
     #[serde(default)]
     pub limit_mm_per_prompt: MmLimitPerPrompt,
 
+    /// Server-side long-edge cap for InternVL image preprocessing: images
+    /// whose long edge exceeds this value are proportionally downscaled to it
+    /// before tiling, replicating the Python tal path's
+    /// `prompt_render.image_resize`. Absent or `0` disables the cap. In the
+    /// Python-supervised path this is set through
+    /// `--additional-config '{"internvl_resize_long_edge": k}'`.
+    #[arg(long = "internvl-resize-long-edge")]
+    #[serde(
+        default,
+        rename = "additional_config",
+        deserialize_with = "deserialize_internvl_resize_long_edge"
+    )]
+    pub internvl_resize_long_edge: Option<u32>,
+
     /// The format to render message content within a chat template.
     ///
     /// * "auto" detects the format from the template
@@ -424,6 +438,7 @@ impl SharedRuntimeArgs {
             chat_template: self.chat_template,
             default_chat_template_kwargs: self.default_chat_template_kwargs,
             limit_mm_per_prompt: self.limit_mm_per_prompt,
+            internvl_resize_long_edge: self.internvl_resize_long_edge,
             chat_template_content_format: self.chat_template_content_format,
             max_logprobs: self.max_logprobs,
             api_server_options,
@@ -477,6 +492,7 @@ impl SharedRuntimeArgs {
             chat_template: self.chat_template,
             default_chat_template_kwargs: self.default_chat_template_kwargs,
             limit_mm_per_prompt: self.limit_mm_per_prompt,
+            internvl_resize_long_edge: self.internvl_resize_long_edge,
             chat_template_content_format: self.chat_template_content_format,
             max_logprobs: self.max_logprobs,
             api_server_options,
@@ -557,6 +573,35 @@ pub struct ProfilerConfig {
 
 fn parse_json<T: DeserializeOwned>(value: &str) -> Result<T, String> {
     serde_json::from_str(value).map_err(|e| format!("invalid JSON object: {}", e.as_report()))
+}
+
+/// Extract `internvl_resize_long_edge` from the `additional_config` object
+/// forwarded by the Python supervisor.
+///
+/// The whole `additional_config` value arrives here (an object shared with
+/// the Python engine side, which ignores unknown keys); only the
+/// `internvl_resize_long_edge` entry is consumed. `0` means "no cap".
+fn deserialize_internvl_resize_long_edge<'de, D>(deserializer: D) -> Result<Option<u32>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error as _;
+
+    let value = Option::<Value>::deserialize(deserializer)?;
+    let Some(entry) = value.as_ref().and_then(|v| v.get("internvl_resize_long_edge")) else {
+        return Ok(None);
+    };
+    if entry.is_null() {
+        return Ok(None);
+    }
+    let raw = entry.as_u64().ok_or_else(|| {
+        D::Error::custom(
+            "additional_config.internvl_resize_long_edge must be a non-negative integer",
+        )
+    })?;
+    u32::try_from(raw).map(|k| (k > 0).then_some(k)).map_err(|_| {
+        D::Error::custom("additional_config.internvl_resize_long_edge must fit in u32")
+    })
 }
 
 fn parse_runtime_args_json(value: &str) -> Result<SharedRuntimeArgs, String> {

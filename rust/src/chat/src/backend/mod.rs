@@ -77,6 +77,10 @@ pub struct LoadModelBackendsOptions {
     /// Maximum number of input items allowed per prompt for each modality.
     /// Unspecified modalities are unlimited.
     pub limit_mm_per_prompt: MmLimitPerPrompt,
+    /// Server-side long-edge cap for InternVL image preprocessing
+    /// (`additional_config.internvl_resize_long_edge`). `None` disables the
+    /// cap.
+    pub internvl_resize_long_edge: Option<u32>,
 }
 
 /// Shared backends loaded from a model id.

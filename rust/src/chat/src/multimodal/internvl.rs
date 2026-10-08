@@ -11,6 +11,11 @@
 //!   closest to the source aspect ratio, resize the image to
 //!   `(448*i, 448*j)` (PIL-compatible bicubic), crop into 448x448 tiles, and
 //!   append a 448x444 global thumbnail when there is more than one tile;
+//! - optional server-side long-edge cap
+//!   (`--additional-config {"internvl_resize_long_edge": k}`): images whose
+//!   long edge exceeds `k` are proportionally downscaled to `k` before
+//!   tiling, replicating the Python tal path's `prompt_render.image_resize`
+//!   bit for bit (PIL bicubic, truncating rounding, no EXIF rotation);
 //! - per-tile ImageNet normalization (mean/std);
 //! - prompt replacement: the `<img>` placeholder expands to
 //!   `<img>` + `<IMG_CONTEXT>` * (`256 * num_patches`) + `</img>`;
@@ -38,8 +43,7 @@ const IMAGE_SIZE: usize = 448;
 const PATCH_SIZE: usize = 14;
 /// Visual tokens per tile after the 2x2 pixel-shuffle downsample:
 /// `1024 * (downsample_ratio=0.5)^2 = 256`.
-const IMAGE_SEQ_LENGTH: usize =
-    (IMAGE_SIZE / PATCH_SIZE) * (IMAGE_SIZE / PATCH_SIZE) / 4;
+const IMAGE_SEQ_LENGTH: usize = (IMAGE_SIZE / PATCH_SIZE) * (IMAGE_SIZE / PATCH_SIZE) / 4;
 /// Upper bound on the dynamic tiling grid (`i * j`).
 const MAX_DYNAMIC_PATCH: usize = 12;
 /// Lower bound on the dynamic tiling grid (`i * j`).
@@ -100,13 +104,43 @@ fn find_closest_aspect_ratio(
 /// Number of 448x448 patches (tiles + optional thumbnail) for one image.
 fn num_patches_for(width: u32, height: u32) -> usize {
     let ratios = target_ratios(MIN_DYNAMIC_PATCH, MAX_DYNAMIC_PATCH);
-    let (grid_w, grid_h) =
-        find_closest_aspect_ratio(f64::from(width) / f64::from(height), &ratios, width, height, IMAGE_SIZE);
+    let (grid_w, grid_h) = find_closest_aspect_ratio(
+        f64::from(width) / f64::from(height),
+        &ratios,
+        width,
+        height,
+        IMAGE_SIZE,
+    );
     let mut patches = grid_w * grid_h;
     if USE_THUMBNAIL && patches > 1 {
         patches += 1;
     }
     patches
+}
+
+/// Capped size for the optional server-side long-edge resize, mirroring the
+/// Python tal path's `prompt_render.image_resize(img, k)`:
+///
+/// ```python
+/// if max(width, height) > k:
+///     ratio = k / max(width, height)
+///     return int(width * ratio), int(height * ratio)
+/// ```
+///
+/// Returns `None` when the long edge is at or below `k` (no resize). The
+/// truncating rounding matters: it can shift the aspect ratio enough to
+/// change the tiling grid, so [`InternVLVisionProcessor::calculate_num_tokens`]
+/// must apply the exact same cap.
+fn capped_size(width: u32, height: u32, k: u32) -> Option<(u32, u32)> {
+    let max_dim = width.max(height);
+    if max_dim <= k {
+        return None;
+    }
+    let ratio = f64::from(k) / f64::from(max_dim);
+    Some((
+        (f64::from(width) * ratio) as u32,
+        (f64::from(height) * ratio) as u32,
+    ))
 }
 
 /// One normalized tile as `[3, 448, 448]`, bit-exact with the Python path
@@ -135,11 +169,19 @@ fn normalized_tile(tile: &DynamicImage) -> ndarray::Array3<f32> {
 /// `image_token_id` kwarg expected by the Python `InternVLChatModel`.
 pub struct InternVLVisionProcessor {
     ctx_token_id: TokenId,
+    /// Optional long-edge cap applied before tiling; the server-side replica
+    /// of the Python tal path's `prompt_render.image_resize(k)`. `None`
+    /// (or `Some(0)` normalized away at the config boundary) leaves images
+    /// untouched.
+    resize_long_edge: Option<u32>,
 }
 
 impl InternVLVisionProcessor {
-    pub fn new(ctx_token_id: TokenId) -> Self {
-        Self { ctx_token_id }
+    pub fn new(ctx_token_id: TokenId, resize_long_edge: Option<u32>) -> Self {
+        Self {
+            ctx_token_id,
+            resize_long_edge,
+        }
     }
 
     /// Tile one image into normalized `[patches, 3, 448, 448]`.
@@ -172,7 +214,11 @@ impl InternVLVisionProcessor {
         if USE_THUMBNAIL && blocks > 1 {
             // The thumbnail is built from the ORIGINAL image, not the tiled
             // one, matching Python `dynamic_preprocess_internvl`.
-            tiles.push(resize_bicubic_pil(&rgb, IMAGE_SIZE as u32, IMAGE_SIZE as u32));
+            tiles.push(resize_bicubic_pil(
+                &rgb,
+                IMAGE_SIZE as u32,
+                IMAGE_SIZE as u32,
+            ));
         }
         // Drop the grid-resized image before stacking to bound peak memory.
         drop(resized);
@@ -180,9 +226,7 @@ impl InternVLVisionProcessor {
         let num_patches = tiles.len();
         let mut output = Array4::<f32>::zeros((num_patches, 3, IMAGE_SIZE, IMAGE_SIZE));
         for (index, tile) in tiles.iter().enumerate() {
-            output
-                .slice_mut(ndarray::s![index, .., .., ..])
-                .assign(&normalized_tile(tile));
+            output.slice_mut(ndarray::s![index, .., .., ..]).assign(&normalized_tile(tile));
         }
         output
     }
@@ -211,45 +255,65 @@ impl VisionPreProcessor for InternVLVisionProcessor {
 
         let mut patch_counts = Vec::with_capacity(images.len());
         let mut item_sizes = Vec::with_capacity(images.len());
-        let mut flat_tiles =
-            Array4::<f32>::zeros((0, 3, IMAGE_SIZE, IMAGE_SIZE));
+        let mut flat_tiles = Array4::<f32>::zeros((0, 3, IMAGE_SIZE, IMAGE_SIZE));
         for image in images {
-            let tiles = self.process_single_image(image);
+            // Optional server-side long-edge cap, applied before tiling.
+            // `item_sizes` reports the size actually tiled (post-cap), which
+            // is what the Python tal path hands to vLLM as well.
+            let (tiles, size) = match self
+                .resize_long_edge
+                .and_then(|k| capped_size(image.width(), image.height(), k))
+            {
+                Some((w, h)) => (
+                    self.process_single_image(&resize_bicubic_pil(image, w, h)),
+                    (w, h),
+                ),
+                None => (
+                    self.process_single_image(image),
+                    (image.width(), image.height()),
+                ),
+            };
             patch_counts.push(tiles.shape()[0]);
-            item_sizes.push((image.width(), image.height()));
+            item_sizes.push(size);
             // Concatenate along the tile axis across all images, producing
             // the flat layout Python calls `pixel_values_flat`.
-            flat_tiles = ndarray::concatenate(
-                ndarray::Axis(0),
-                &[flat_tiles.view(), tiles.view()],
-            )
-            .expect("tile shapes are identical")
-            .to_owned();
+            flat_tiles = ndarray::concatenate(ndarray::Axis(0), &[flat_tiles.view(), tiles.view()])
+                .expect("tile shapes are identical")
+                .to_owned();
         }
 
-        let feature_token_counts: Vec<usize> = patch_counts
-            .iter()
-            .map(|&patches| patches * IMAGE_SEQ_LENGTH)
-            .collect();
+        let feature_token_counts: Vec<usize> =
+            patch_counts.iter().map(|&patches| patches * IMAGE_SEQ_LENGTH).collect();
 
         let num_images = images.len();
-        let preprocessed = PreprocessedEncoderInputs::new(
-            flat_tiles,
-            feature_token_counts,
-            item_sizes,
-        )
-        .with_extra(
-            "image_num_patches",
-            ModelSpecificValue::UintTensor {
-                data: patch_counts.iter().map(|&n| n as u32).collect(),
-                shape: vec![num_images],
-            },
-        )
-        .with_extra("image_token_id", ModelSpecificValue::Int(i64::from(self.ctx_token_id)));
+        let preprocessed =
+            PreprocessedEncoderInputs::new(flat_tiles, feature_token_counts, item_sizes)
+                .with_extra(
+                    "image_num_patches",
+                    ModelSpecificValue::UintTensor {
+                        data: patch_counts.iter().map(|&n| n as u32).collect(),
+                        shape: vec![num_images],
+                    },
+                )
+                .with_extra(
+                    "image_token_id",
+                    ModelSpecificValue::Int(i64::from(self.ctx_token_id)),
+                );
         Ok(preprocessed)
     }
 
-    fn calculate_num_tokens(&self, width: u32, height: u32, _config: &llm_multimodal::PreProcessorConfig) -> usize {
+    fn calculate_num_tokens(
+        &self,
+        width: u32,
+        height: u32,
+        _config: &llm_multimodal::PreProcessorConfig,
+    ) -> usize {
+        // Apply the same long-edge cap as `preprocess`: the truncating
+        // rounding can change the aspect ratio and with it the tiling grid.
+        let (width, height) = self
+            .resize_long_edge
+            .and_then(|k| capped_size(width, height, k))
+            .unwrap_or((width, height));
         num_patches_for(width, height) * IMAGE_SEQ_LENGTH
     }
 
@@ -264,10 +328,7 @@ pub struct InternVLProcessorSpec;
 /// Whether a model is an InternVL chat model, per its config or id.
 pub(super) fn is_internvl(metadata: &ModelMetadata) -> bool {
     metadata.config_model_type() == Some("internvl_chat")
-        || metadata
-            .model_id
-            .to_lowercase()
-            .contains("internvl")
+        || metadata.model_id.to_lowercase().contains("internvl")
 }
 
 impl ModelProcessorSpec for InternVLProcessorSpec {
@@ -367,10 +428,58 @@ mod tests {
     }
 
     #[test]
-    fn preprocess_builds_flat_tile_tensor() {
-        let processor = InternVLVisionProcessor::new(151_667);
+    fn capped_size_matches_prompt_render_math() {
+        // Python prompt_render.image_resize(k=2048): int(w * k / max) with
+        // truncation toward zero, only when the long edge exceeds k.
+        assert_eq!(capped_size(3524, 1508, 2048), Some((2048, 876)));
+        assert_eq!(capped_size(2817, 1357, 2048), Some((2048, 986)));
+        // 1000 * 2048 / 2049 = 999.51... truncates to 999.
+        assert_eq!(capped_size(2049, 1000, 2048), Some((2048, 999)));
+        // Portrait orientation caps the height instead.
+        assert_eq!(capped_size(1508, 3524, 2048), Some((876, 2048)));
+        // Long edge exactly at the cap or below: untouched.
+        assert_eq!(capped_size(2048, 1000, 2048), None);
+        assert_eq!(capped_size(448, 448, 2048), None);
+    }
+
+    #[test]
+    fn server_side_cap_equals_client_side_resize() {
+        // Enabling the cap must be equivalent to preprocessing the same
+        // image pre-resized to the capped size — i.e. the server-side cap
+        // replaces the client-side replication byte for byte.
+        let big = image_of(3524, 1508);
+        let pre_resized = resize_bicubic_pil(&big, 2048, 876);
+        let capped = InternVLVisionProcessor::new(151_667, Some(2048))
+            .preprocess(&[big], &Default::default())
+            .expect("capped preprocess succeeds");
+        let manual = InternVLVisionProcessor::new(151_667, None)
+            .preprocess(&[pre_resized], &Default::default())
+            .expect("manual preprocess succeeds");
+        assert_eq!(capped.encoder_input, manual.encoder_input);
+        assert_eq!(capped.feature_token_counts, manual.feature_token_counts);
+        assert_eq!(capped.item_sizes, manual.item_sizes);
+    }
+
+    #[test]
+    fn num_tokens_and_preprocess_agree_under_cap() {
+        let processor = InternVLVisionProcessor::new(151_667, Some(2048));
         let preprocessed = processor
-            .preprocess(&[image_of(800, 600), image_of(448, 448)], &Default::default())
+            .preprocess(&[image_of(3524, 1508)], &Default::default())
+            .expect("preprocess succeeds");
+        assert_eq!(
+            processor.calculate_num_tokens(3524, 1508, &Default::default()),
+            preprocessed.feature_token_counts[0]
+        );
+    }
+
+    #[test]
+    fn preprocess_builds_flat_tile_tensor() {
+        let processor = InternVLVisionProcessor::new(151_667, None);
+        let preprocessed = processor
+            .preprocess(
+                &[image_of(800, 600), image_of(448, 448)],
+                &Default::default(),
+            )
             .expect("preprocess succeeds");
 
         // 13 + 1 tiles flattened along dim 0.
@@ -391,4 +500,3 @@ mod tests {
         }
     }
 }
-
